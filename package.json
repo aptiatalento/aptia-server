@@ -1,0 +1,24 @@
+{
+  "name": "aptia-server",
+  "version": "1.0.0",
+  "description": "APTIA - Agente automático de selección de personal con IA",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "better-sqlite3": "^9.4.3",
+    "imapflow": "^1.0.148",
+    "mailparser": "^3.6.5",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.6.0",
+    "nodemailer": "^6.9.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  }
+}
