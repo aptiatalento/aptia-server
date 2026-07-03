@@ -915,6 +915,65 @@ app.get('/api/stats', (req, res) => {
   res.json({ candidatos, avanzar, activas, scorePromedio: Math.round(prom) });
 });
 
+// ═══════════════════════════════════════
+// PROFILEGAME - ALMACENAMIENTO COMPARTIDO
+// Sincroniza resultados, benchmarks y exitosos entre navegadores/perfiles.
+// Claves permitidas: pg4 (resultados), pg_jobs (benchmarks), pg_succ (exitosos)
+// ═══════════════════════════════════════
+db.exec(`CREATE TABLE IF NOT EXISTS pg_store (
+  clave TEXT PRIMARY KEY,
+  valor TEXT,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`);
+
+const PG_CLAVES = ['pg4', 'pg_jobs', 'pg_succ'];
+
+function pgLeer(clave) {
+  const r = db.prepare('SELECT valor FROM pg_store WHERE clave = ?').get(clave);
+  if (!r) return null;
+  try { return JSON.parse(r.valor); } catch (e) { return null; }
+}
+function pgGuardar(clave, valor) {
+  db.prepare(`INSERT INTO pg_store (clave, valor, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor, updated_at = CURRENT_TIMESTAMP`)
+    .run(clave, JSON.stringify(valor));
+}
+// Huella de un resultado para no duplicarlo al fusionar dos navegadores
+function pgHuella(r) {
+  const p = r && r.pct ? r.pct : {};
+  return (r.name || '') + '|' + (r.date || '') + '|' + (p.D||0) + '-' + (p.I||0) + '-' + (p.S||0) + '-' + (p.C||0);
+}
+
+// SYNC de resultados: recibe lo que el navegador tiene, lo fusiona con lo del
+// server (union sin duplicados, gana el que tenga success=true) y devuelve todo.
+app.post('/api/pg/pg4/sync', (req, res) => {
+  const cliente = Array.isArray(req.body && req.body.valor) ? req.body.valor : [];
+  const servidor = pgLeer('pg4') || [];
+  const mapa = new Map();
+  servidor.concat(cliente).forEach(r => {
+    if (!r || !r.name) return;
+    const h = pgHuella(r);
+    const previo = mapa.get(h);
+    if (!previo || (r.success && !previo.success)) mapa.set(h, r);
+  });
+  const fusionado = [...mapa.values()];
+  pgGuardar('pg4', fusionado);
+  res.json({ valor: fusionado });
+});
+
+// Leer una clave
+app.get('/api/pg/:clave', (req, res) => {
+  if (!PG_CLAVES.includes(req.params.clave)) return res.status(400).json({ error: 'Clave no permitida' });
+  res.json({ valor: pgLeer(req.params.clave) });
+});
+
+// Guardar (reemplaza) una clave: se usa para borrar resultados y para benchmarks/exitosos
+app.post('/api/pg/:clave', (req, res) => {
+  if (!PG_CLAVES.includes(req.params.clave)) return res.status(400).json({ error: 'Clave no permitida' });
+  pgGuardar(req.params.clave, (req.body || {}).valor);
+  res.json({ ok: true });
+});
+
 // Forzar revision de mails
 app.post('/api/monitor/check', async (req, res) => {
   revisarEmails();
