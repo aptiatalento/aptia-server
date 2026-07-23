@@ -111,6 +111,7 @@ ensureColumn('candidatos', 'notas_entrevista', 'TEXT');
 ensureColumn('candidatos', 'score_final', 'INTEGER');
 ensureColumn('candidatos', 'informe_final', 'TEXT');
 ensureColumn('candidatos', 'estado_proceso', "TEXT DEFAULT 'Analizado'");
+ensureColumn('candidatos', 'ubicacion', 'TEXT');
 
 // ═══════════════════════════════════════
 // CLAUDE API
@@ -184,6 +185,7 @@ Reglas de scoring (0-100):
 Devolve SOLO este JSON:
 {
   "nombre": "nombre del candidato extraido del CV",
+  "ubicacion": "de donde es, tal como figura en el CV. Formato: Localidad, Partido/Zona, Distrito. Distingui bien CABA (Capital Federal) de Provincia de Buenos Aires; si es otra provincia nombrala. Si el CV no dice nada, poné exactamente: No figura en el CV",
   "score": 0-100,
   "formacion": 0-20,
   "experiencia": 0-25,
@@ -236,6 +238,7 @@ Reajusta tambien formacion, experiencia, hardSkills, softSkills y fitCultural se
 Devolve SOLO este JSON (mismas claves de siempre):
 {
   "nombre": "nombre del candidato",
+  "ubicacion": "de donde es (CV o entrevista). Localidad, Partido/Zona, Distrito. Distingui CABA de Provincia de Buenos Aires. Si no hay dato: No figura en el CV",
   "score": 0-100,
   "formacion": 0-20,
   "experiencia": 0-25,
@@ -379,6 +382,7 @@ async function enviarInforme(analisis, busqueda) {
       '<div style="background:#0F1B3D;border-radius:10px;padding:20px;margin:15px 0;">' +
         '<p style="margin:0;"><strong>Candidato:</strong> ' + analisis.nombre + '</p>' +
         '<p style="margin:6px 0;"><strong>Puesto:</strong> ' + busqueda.puesto + ' — ' + busqueda.empresa + '</p>' +
+        '<p style="margin:6px 0;"><strong>Ubicacion:</strong> ' + (analisis.ubicacion || 'No figura en el CV') + '</p>' +
         '<p style="margin:6px 0;"><strong>Score tecnico:</strong> ' + scoreColor + ' <strong style="font-size:24px;color:#fff;">' + analisis.score + '/100</strong></p>' +
         '<p style="margin:6px 0;"><strong>Recomendacion:</strong> <span style="color:' + recColor + ';font-weight:700;">' + analisis.recomendacion + '</span></p>' +
       '</div>' +
@@ -407,8 +411,8 @@ function guardarCandidato(busqueda_id, email_origen, cvTexto, analisis) {
   const stmt = db.prepare(`
     INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, score,
       formacion, experiencia, hard_skills_score, soft_skills_score, fit_cultural,
-      fortalezas, brechas, excluyentes_no_cumplidos, resumen, recomendacion, preguntas, estado_proceso)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Analizado')
+      fortalezas, brechas, excluyentes_no_cumplidos, resumen, recomendacion, preguntas, ubicacion, estado_proceso)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Analizado')
   `);
   const r = stmt.run(
     busqueda_id, analisis.nombre, email_origen || null, cvTexto.substring(0, 5000), analisis.score,
@@ -416,7 +420,8 @@ function guardarCandidato(busqueda_id, email_origen, cvTexto, analisis) {
     JSON.stringify(analisis.fortalezas || []), JSON.stringify(analisis.brechas || []),
     JSON.stringify(analisis.excluyentesNoCumplidos || []),
     analisis.resumen, analisis.recomendacion,
-    JSON.stringify(analisis.preguntasPreEntrevista || [])
+    JSON.stringify(analisis.preguntasPreEntrevista || []),
+    analisis.ubicacion || null
   );
   return r.lastInsertRowid;
 }
@@ -633,13 +638,13 @@ app.post('/api/analizar', async (req, res) => {
       // reasignar un CV que estaba "sin asignar" o reanalizar un candidato existente
       db.prepare(`UPDATE candidatos SET busqueda_id=?, nombre=?, score=?, formacion=?, experiencia=?,
         hard_skills_score=?, soft_skills_score=?, fit_cultural=?, fortalezas=?, brechas=?,
-        excluyentes_no_cumplidos=?, resumen=?, recomendacion=?, preguntas=?, estado_proceso='Analizado'
+        excluyentes_no_cumplidos=?, resumen=?, recomendacion=?, preguntas=?, ubicacion=?, estado_proceso='Analizado'
         WHERE id=?`).run(
         busqueda_id, analisis.nombre, analisis.score, analisis.formacion, analisis.experiencia,
         analisis.hardSkills, analisis.softSkills, analisis.fitCultural,
         JSON.stringify(analisis.fortalezas || []), JSON.stringify(analisis.brechas || []),
         JSON.stringify(analisis.excluyentesNoCumplidos || []), analisis.resumen, analisis.recomendacion,
-        JSON.stringify(analisis.preguntasPreEntrevista || []), candidato_id);
+        JSON.stringify(analisis.preguntasPreEntrevista || []), analisis.ubicacion || null, candidato_id);
       if (tieneEntrevista) db.prepare("UPDATE candidatos SET estado_proceso='Reanalizado c/entrevista' WHERE id=?").run(candidato_id);
       id = candidato_id;
     } else {
