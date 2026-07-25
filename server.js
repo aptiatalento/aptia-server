@@ -7,10 +7,11 @@ const { simpleParser } = require('mailparser');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '12mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // ═══════════════════════════════════════
 // BASE DE DATOS
@@ -93,6 +94,18 @@ db.exec(`
     subject TEXT,
     processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS cola (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    busqueda_id INTEGER,
+    nombre_archivo TEXT,
+    cv_texto TEXT,
+    cv_hash TEXT,
+    estado TEXT DEFAULT 'pendiente',
+    error TEXT,
+    candidato_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migracion suave: agregar columnas nuevas si la DB es vieja
@@ -111,7 +124,7 @@ ensureColumn('candidatos', 'notas_entrevista', 'TEXT');
 ensureColumn('candidatos', 'score_final', 'INTEGER');
 ensureColumn('candidatos', 'informe_final', 'TEXT');
 ensureColumn('candidatos', 'estado_proceso', "TEXT DEFAULT 'Analizado'");
-ensureColumn('candidatos', 'ubicacion', 'TEXT');
+ensureColumn('candidatos', 'cv_hash', 'TEXT');
 
 // ═══════════════════════════════════════
 // CLAUDE API
@@ -185,7 +198,6 @@ Reglas de scoring (0-100):
 Devolve SOLO este JSON:
 {
   "nombre": "nombre del candidato extraido del CV",
-  "ubicacion": "de donde es, tal como figura en el CV. Formato: Localidad, Partido/Zona, Distrito. Distingui bien CABA (Capital Federal) de Provincia de Buenos Aires; si es otra provincia nombrala. Si el CV no dice nada, poné exactamente: No figura en el CV",
   "score": 0-100,
   "formacion": 0-20,
   "experiencia": 0-25,
@@ -202,55 +214,6 @@ Devolve SOLO este JSON:
   ]
 }
 Genera entre 8 y 10 preguntas de pre-entrevista.`;
-
-  return await callClaude(prompt, 4000);
-}
-
-// ═══════════════════════════════════════
-// REANALISIS CON ENTREVISTA
-// La entrevista es evidencia nueva que mueve el score en los dos sentidos.
-// ═══════════════════════════════════════
-async function reanalizarConEntrevista(cvTexto, busqueda, cand) {
-  const disc = cand.disc_resultado ? safeParse(cand.disc_resultado) : null;
-  const prompt = `Reanaliza a este candidato. Ya tenias su CV; ahora sumas lo que paso en la entrevista.
-La entrevista es EVIDENCIA NUEVA y puede mover el puntaje para arriba o para abajo. NO devuelvas el mismo analisis sin cambios: tenes que reajustar segun lo que se confirmo o se cayo en la entrevista.
-
-PERFIL DEL PUESTO:
-${perfilTexto(busqueda)}
-
-CV DEL CANDIDATO:
-${cvTexto.substring(0, 12000)}
-
-ANALISIS PREVIO (solo CV): score ${cand.score}/100 — ${cand.recomendacion || '-'}
-DISC: ${disc ? JSON.stringify(disc) : 'No realizado'}
-
-NOTAS DE LA ENTREVISTA (lectura del consultor):
-${cand.notas_entrevista}
-
-Reglas para reajustar el SCORE TECNICO:
-- Si en la entrevista DEMOSTRO conocimiento o experiencia que el CV no dejaba ver, SUBI el tecnico y explica por que. Un CV pobre no condena a alguien que en la entrevista demuestra que sabe.
-- Si NO pudo sostener lo que decia el CV (no supo explicar, se contradijo), BAJA el tecnico. La gente a veces infla el CV.
-- El ajuste tiene que estar justificado por la entrevista, no por simpatia. La lectura sigue siendo rigurosa.
-- Los excluyentes reales siguen siendo excluyentes, salvo que la entrevista demuestre que en realidad SI se cumplen.
-
-Reajusta tambien formacion, experiencia, hardSkills, softSkills y fitCultural segun lo confirmado. Reescribi resumen, fortalezas y brechas integrando CV + entrevista (no solo el CV).
-
-Devolve SOLO este JSON (mismas claves de siempre):
-{
-  "nombre": "nombre del candidato",
-  "ubicacion": "de donde es (CV o entrevista). Localidad, Partido/Zona, Distrito. Distingui CABA de Provincia de Buenos Aires. Si no hay dato: No figura en el CV",
-  "score": 0-100,
-  "formacion": 0-20,
-  "experiencia": 0-25,
-  "hardSkills": 0-25,
-  "softSkills": 0-15,
-  "fitCultural": 0-15,
-  "fortalezas": ["punto con evidencia de CV o entrevista", "..."],
-  "brechas": ["que sigue faltando", "..."],
-  "excluyentesNoCumplidos": ["si queda alguno sin cumplir", "..."],
-  "resumen": "3-4 lineas integrando CV + entrevista; deci si el score subio o bajo respecto del CV y por que",
-  "recomendacion": "AVANZAR" | "AVANZAR CON RESERVAS" | "NO AVANZAR"
-}`;
 
   return await callClaude(prompt, 4000);
 }
@@ -285,14 +248,8 @@ Devolve SOLO este JSON:
 // INFORME FINAL (tecnico + DISC + entrevista)
 // ═══════════════════════════════════════
 async function generarInformeFinal(candidato, busqueda) {
-  const disc = candidato.disc_resultado ? safeParse(candidato.disc_resultado) : null;
-  const prompt = `Genera el informe final integrado de este candidato. Este informe lo LEE LA EMPRESA CLIENTE, no el consultor.
-
-REGLAS DE REDACCION (importante):
-- Escribi para la empresa cliente, en tono profesional y en tercera persona sobre el candidato. Es APTIA presentando el perfil a la empresa. No te dirijas al consultor, no uses "te recomiendo".
-- No menciones a Hernan ni "el consultor" ni "segun las notas". Usa la entrevista como insumo para tu conclusion, sin citarla.
-- No reproduzcas las preguntas de la entrevista ni el detalle DISC letra por letra. Solo la sintesis integrada y su conclusion.
-- Se honesto: si hay reservas, decilas con criterio profesional.
+  const disc = candidato.disc_resultado ? JSON.parse(candidato.disc_resultado) : null;
+  const prompt = `Genera el informe final integrado de este candidato para presentar al cliente.
 
 PUESTO: ${busqueda.puesto} — ${busqueda.empresa}
 
@@ -307,7 +264,7 @@ COMPATIBILIDAD DISC: ${candidato.disc_compatibilidad != null ? candidato.disc_co
 NOTAS DE LA ENTREVISTA (escritas por el consultor Hernan Salas):
 ${candidato.notas_entrevista || 'Sin entrevista registrada'}
 
-Integra las tres capas (tecnica, conductual y la entrevista) en una sola sintesis para el cliente. Devolve SOLO este JSON:
+Integra las tres capas (tecnica, conductual y la lectura humana del consultor). Devolve SOLO este JSON:
 {
   "scoreFinal": 0-100,
   "veredictoFinal": "RECOMENDADO" | "RECOMENDADO CON OBSERVACIONES" | "NO RECOMENDADO",
@@ -382,7 +339,6 @@ async function enviarInforme(analisis, busqueda) {
       '<div style="background:#0F1B3D;border-radius:10px;padding:20px;margin:15px 0;">' +
         '<p style="margin:0;"><strong>Candidato:</strong> ' + analisis.nombre + '</p>' +
         '<p style="margin:6px 0;"><strong>Puesto:</strong> ' + busqueda.puesto + ' — ' + busqueda.empresa + '</p>' +
-        '<p style="margin:6px 0;"><strong>Ubicacion:</strong> ' + (analisis.ubicacion || 'No figura en el CV') + '</p>' +
         '<p style="margin:6px 0;"><strong>Score tecnico:</strong> ' + scoreColor + ' <strong style="font-size:24px;color:#fff;">' + analisis.score + '/100</strong></p>' +
         '<p style="margin:6px 0;"><strong>Recomendacion:</strong> <span style="color:' + recColor + ';font-weight:700;">' + analisis.recomendacion + '</span></p>' +
       '</div>' +
@@ -407,23 +363,64 @@ async function enviarInforme(analisis, busqueda) {
 // ═══════════════════════════════════════
 // GUARDAR CANDIDATO ANALIZADO
 // ═══════════════════════════════════════
+function hashCV(t) {
+  return crypto.createHash('sha1')
+    .update(String(t || '').replace(/\s+/g, ' ').trim().toLowerCase())
+    .digest('hex');
+}
+
 function guardarCandidato(busqueda_id, email_origen, cvTexto, analisis) {
   const stmt = db.prepare(`
-    INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, score,
+    INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, cv_hash, score,
       formacion, experiencia, hard_skills_score, soft_skills_score, fit_cultural,
-      fortalezas, brechas, excluyentes_no_cumplidos, resumen, recomendacion, preguntas, ubicacion, estado_proceso)
+      fortalezas, brechas, excluyentes_no_cumplidos, resumen, recomendacion, preguntas, estado_proceso)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Analizado')
   `);
   const r = stmt.run(
-    busqueda_id, analisis.nombre, email_origen || null, cvTexto.substring(0, 5000), analisis.score,
+    busqueda_id, analisis.nombre, email_origen || null, cvTexto.substring(0, 5000), hashCV(cvTexto), analisis.score,
     analisis.formacion, analisis.experiencia, analisis.hardSkills, analisis.softSkills, analisis.fitCultural,
     JSON.stringify(analisis.fortalezas || []), JSON.stringify(analisis.brechas || []),
     JSON.stringify(analisis.excluyentesNoCumplidos || []),
     analisis.resumen, analisis.recomendacion,
-    JSON.stringify(analisis.preguntasPreEntrevista || []),
-    analisis.ubicacion || null
+    JSON.stringify(analisis.preguntasPreEntrevista || [])
   );
   return r.lastInsertRowid;
+}
+
+// ═══════════════════════════════════════
+// COLA DE ANALISIS (worker en segundo plano)
+// El navegador solo encola; el server procesa de a uno, solo,
+// sin depender de que la compu este prendida.
+// ═══════════════════════════════════════
+let colaActiva = false;
+async function procesarCola() {
+  if (colaActiva) return;
+  colaActiva = true;
+  try {
+    while (true) {
+      const item = db.prepare("SELECT * FROM cola WHERE estado = 'pendiente' ORDER BY id ASC LIMIT 1").get();
+      if (!item) break;
+      db.prepare("UPDATE cola SET estado = 'procesando' WHERE id = ?").run(item.id);
+      try {
+        const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(item.busqueda_id);
+        if (!busqueda) {
+          db.prepare("UPDATE cola SET estado = 'error', error = 'Busqueda no encontrada' WHERE id = ?").run(item.id);
+          continue;
+        }
+        const analisis = await analizarCV(item.cv_texto, busqueda);
+        const candId = guardarCandidato(item.busqueda_id, null, item.cv_texto, analisis);
+        db.prepare("UPDATE cola SET estado = 'listo', candidato_id = ? WHERE id = ?").run(candId, item.id);
+        try { await enviarInforme(analisis, busqueda); } catch (e) { console.log('aviso mail: ' + e.message); }
+        console.log('✅ Cola: ' + (analisis.nombre || item.nombre_archivo) + ' (' + analisis.score + '/100)');
+      } catch (e) {
+        db.prepare("UPDATE cola SET estado = 'error', error = ? WHERE id = ?")
+          .run(String(e.message || e).substring(0, 300), item.id);
+        console.log('❌ Cola error en ' + item.nombre_archivo + ': ' + e.message);
+      }
+    }
+  } finally {
+    colaActiva = false;
+  }
 }
 
 // ═══════════════════════════════════════
@@ -621,39 +618,24 @@ app.post('/api/analizar', async (req, res) => {
   const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(busqueda_id);
   if (!busqueda) return res.status(404).json({ error: 'Busqueda no encontrada' });
   try {
-    let candExistente = null;
-    if (candidato_id) candExistente = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(candidato_id);
-    const tieneEntrevista = !!(candExistente && candExistente.notas_entrevista && candExistente.notas_entrevista.trim());
-
-    // Si ya hay entrevista cargada, la entrevista es evidencia que mueve el score. Si no, analisis normal de CV.
-    const analisis = tieneEntrevista
-      ? await reanalizarConEntrevista(cv_texto, busqueda, candExistente)
-      : await analizarCV(cv_texto, busqueda);
-
-    // En el reanalisis con entrevista conservamos las preguntas ya generadas.
-    if (tieneEntrevista) analisis.preguntasPreEntrevista = candExistente.preguntas ? safeParse(candExistente.preguntas) : [];
-
+    const analisis = await analizarCV(cv_texto, busqueda);
     let id;
     if (candidato_id) {
-      // reasignar un CV que estaba "sin asignar" o reanalizar un candidato existente
+      // reasignar un CV que estaba "sin asignar"
       db.prepare(`UPDATE candidatos SET busqueda_id=?, nombre=?, score=?, formacion=?, experiencia=?,
         hard_skills_score=?, soft_skills_score=?, fit_cultural=?, fortalezas=?, brechas=?,
-        excluyentes_no_cumplidos=?, resumen=?, recomendacion=?, preguntas=?, ubicacion=?, estado_proceso='Analizado'
+        excluyentes_no_cumplidos=?, resumen=?, recomendacion=?, preguntas=?, estado_proceso='Analizado'
         WHERE id=?`).run(
         busqueda_id, analisis.nombre, analisis.score, analisis.formacion, analisis.experiencia,
         analisis.hardSkills, analisis.softSkills, analisis.fitCultural,
         JSON.stringify(analisis.fortalezas || []), JSON.stringify(analisis.brechas || []),
         JSON.stringify(analisis.excluyentesNoCumplidos || []), analisis.resumen, analisis.recomendacion,
-        JSON.stringify(analisis.preguntasPreEntrevista || []), analisis.ubicacion || null, candidato_id);
-      if (tieneEntrevista) db.prepare("UPDATE candidatos SET estado_proceso='Reanalizado c/entrevista' WHERE id=?").run(candidato_id);
+        JSON.stringify(analisis.preguntasPreEntrevista || []), candidato_id);
       id = candidato_id;
     } else {
       id = guardarCandidato(busqueda_id, null, cv_texto, analisis);
     }
-    // El mail de "CV analizado + preguntas" solo tiene sentido antes de la entrevista.
-    if (!tieneEntrevista) {
-      try { await enviarInforme(analisis, busqueda); } catch (e) { console.log('aviso: no se pudo mandar mail: ' + e.message); }
-    }
+    try { await enviarInforme(analisis, busqueda); } catch (e) { console.log('aviso: no se pudo mandar mail: ' + e.message); }
     res.json(Object.assign({ id: id }, analisis));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -724,7 +706,52 @@ app.post('/api/monitor/check', async (req, res) => {
   res.json({ message: 'Revision disparada' });
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.0.0' }));
+// Encolar un lote de CVs (no bloquea; el worker los procesa en segundo plano)
+app.post('/api/cola/agregar', (req, res) => {
+  const { busqueda_id, cvs } = req.body || {};
+  if (!busqueda_id || !Array.isArray(cvs)) return res.status(400).json({ error: 'Faltan busqueda_id o cvs' });
+  const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(busqueda_id);
+  if (!busqueda) return res.status(404).json({ error: 'Busqueda no encontrada' });
+
+  let encolados = 0, duplicados = 0, vacios = 0;
+  const insert = db.prepare("INSERT INTO cola (busqueda_id, nombre_archivo, cv_texto, cv_hash, estado) VALUES (?, ?, ?, ?, 'pendiente')");
+
+  for (const cv of cvs) {
+    const texto = (cv && cv.texto ? String(cv.texto) : '').trim();
+    const nombre = cv && cv.nombre ? String(cv.nombre) : 'CV';
+    if (texto.length < 80) { vacios++; continue; }
+    const h = hashCV(texto);
+    const yaCand = db.prepare('SELECT id FROM candidatos WHERE busqueda_id = ? AND cv_hash = ?').get(busqueda_id, h);
+    const yaCola = db.prepare("SELECT id FROM cola WHERE busqueda_id = ? AND cv_hash = ? AND estado IN ('pendiente','procesando')").get(busqueda_id, h);
+    if (yaCand || yaCola) { duplicados++; continue; }
+    insert.run(busqueda_id, nombre, texto, h);
+    encolados++;
+  }
+
+  setTimeout(procesarCola, 200);
+  res.json({ encolados, duplicados, vacios });
+});
+
+// Estado de la cola (para que el panel muestre el progreso sin manejar el trabajo)
+app.get('/api/cola/estado', (req, res) => {
+  const { busqueda_id } = req.query;
+  const where = busqueda_id ? ' WHERE busqueda_id = ' + Number(busqueda_id) : '';
+  const rows = db.prepare('SELECT estado, COUNT(*) n FROM cola' + where + ' GROUP BY estado').all();
+  const resumen = { pendiente: 0, procesando: 0, listo: 0, error: 0 };
+  rows.forEach(r => { resumen[r.estado] = r.n; });
+  const items = db.prepare('SELECT id, nombre_archivo, estado, error, candidato_id FROM cola' + where + ' ORDER BY id DESC LIMIT 300').all();
+  res.json({ resumen, items });
+});
+
+// Limpiar de la cola los que ya terminaron (listos y errores) de una busqueda
+app.post('/api/cola/limpiar', (req, res) => {
+  const { busqueda_id } = req.body || {};
+  const where = busqueda_id ? ' AND busqueda_id = ' + Number(busqueda_id) : '';
+  db.prepare("DELETE FROM cola WHERE estado IN ('listo','error')" + where).run();
+  res.json({ ok: true });
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.1.0' }));
 app.get('/', (req, res) => res.json({ service: 'APTIA agente', estado: 'online', endpoints: ['/api/busquedas', '/api/candidatos', '/api/stats'] }));
 
 // ═══════════════════════════════════════
@@ -736,6 +763,9 @@ const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '120000', 10);
 app.listen(PORT, () => {
   console.log('🚀 APTIA server v2.0.0 escuchando en puerto ' + PORT);
   console.log('📨 Monitor de Gmail cada ' + (CHECK_INTERVAL / 1000) + 's');
+  console.log('⚙️  Worker de cola activo (procesa CVs en segundo plano)');
   setTimeout(revisarEmails, 5000);
   setInterval(revisarEmails, CHECK_INTERVAL);
+  setTimeout(procesarCola, 6000);
+  setInterval(procesarCola, 15000);
 });
