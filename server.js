@@ -8,17 +8,17 @@ const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
- 
+
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
- 
+app.use(express.json({ limit: '150mb' })); // sube el limite: ahora tambien viaja el archivo original del CV (base64)
+
 // ═══════════════════════════════════════
 // BASE DE DATOS
 // ═══════════════════════════════════════
 const db = new Database(process.env.DB_PATH || './aptia.db');
 db.pragma('journal_mode = WAL');
- 
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS busquedas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +57,7 @@ db.exec(`
     estado TEXT DEFAULT 'activa',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
- 
+
   CREATE TABLE IF NOT EXISTS candidatos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     busqueda_id INTEGER,
@@ -86,7 +86,7 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (busqueda_id) REFERENCES busquedas(id)
   );
- 
+
   CREATE TABLE IF NOT EXISTS emails_procesados (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id TEXT UNIQUE,
@@ -94,7 +94,7 @@ db.exec(`
     subject TEXT,
     processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
- 
+
   CREATE TABLE IF NOT EXISTS cola (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     busqueda_id INTEGER,
@@ -106,8 +106,16 @@ db.exec(`
     candidato_id INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS cv_archivos (
+    cv_hash TEXT PRIMARY KEY,
+    nombre TEXT,
+    mime TEXT,
+    base64 TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
- 
+
 // Migracion suave: agregar columnas nuevas si la DB es vieja
 function ensureColumn(table, col, def) {
   try {
@@ -125,13 +133,15 @@ ensureColumn('candidatos', 'score_final', 'INTEGER');
 ensureColumn('candidatos', 'informe_final', 'TEXT');
 ensureColumn('candidatos', 'estado_proceso', "TEXT DEFAULT 'Analizado'");
 ensureColumn('candidatos', 'cv_hash', 'TEXT');
- 
+ensureColumn('candidatos', 'portfolio_analisis', 'TEXT');
+ensureColumn('candidatos', 'portfolio_score', 'INTEGER');
+
 // ═══════════════════════════════════════
 // CLAUDE API
 // ═══════════════════════════════════════
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
- 
+
 async function callClaude(prompt, maxTokens) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -156,7 +166,7 @@ async function callClaude(prompt, maxTokens) {
   txt = txt.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
   return JSON.parse(txt);
 }
- 
+
 // ═══════════════════════════════════════
 // ANALISIS DE CV vs PUESTO
 // ═══════════════════════════════════════
@@ -178,23 +188,23 @@ function perfilTexto(b) {
     'Deal breakers: ' + (b.deal_breakers || '-')
   ].join('\n');
 }
- 
+
 async function analizarCV(cvTexto, busqueda) {
   const prompt = `Analiza este CV contra el perfil del puesto. Se critico y realista.
- 
+
 PERFIL DEL PUESTO:
 ${perfilTexto(busqueda)}
- 
+
 CV DEL CANDIDATO:
 ${cvTexto.substring(0, 12000)}
- 
+
 Reglas de scoring (0-100):
 - Si NO cumple un requisito EXCLUYENTE (formacion minima, experiencia minima, hard skill obligatorio, idioma, certificacion, deal breaker): score maximo 40 y recomendacion "NO AVANZAR".
 - 85-100: AVANZAR (candidato fuerte)
 - 70-84: AVANZAR
 - 55-69: AVANZAR CON RESERVAS
 - menos de 55: NO AVANZAR
- 
+
 Devolve SOLO este JSON:
 {
   "nombre": "nombre del candidato extraido del CV",
@@ -214,23 +224,92 @@ Devolve SOLO este JSON:
   ]
 }
 Genera entre 8 y 10 preguntas de pre-entrevista.`;
- 
+
   return await callClaude(prompt, 4000);
 }
- 
+
 // ═══════════════════════════════════════
 // ANALISIS DISC vs PUESTO
 // ═══════════════════════════════════════
+// ═══════════════════════════════════════
+// ANALISIS DE PORTFOLIO
+// ═══════════════════════════════════════
+
+// Variante de callClaude que ademas manda un PDF para que la IA lo mire.
+async function callClaudeDoc(pdfBase64, prompt, maxTokens) {
+  const b64 = String(pdfBase64 || '').replace(/^data:[^,]*,/, '');
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens || 2500,
+      system: 'Sos el motor de IA de APTIA, consultora de seleccion en Argentina. Respondes SOLO en JSON valido, sin markdown ni backticks. Sos critico y realista, no inflas.',
+      messages: [{ role: 'user', content: [
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } },
+        { type: 'text', text: prompt }
+      ] }]
+    })
+  });
+  if (!res.ok) { const t = await res.text(); throw new Error('Claude API error ' + res.status + ': ' + t); }
+  const data = await res.json();
+  let txt = (data.content || []).map(b => b.text || '').join('').trim();
+  txt = txt.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+  return JSON.parse(txt);
+}
+
+function portfolioJSONSpec() {
+  return `Devolve SOLO este JSON:
+{
+  "veredicto": "COMPATIBLE" | "COMPATIBLE CON OBSERVACIONES" | "BAJA COMPATIBILIDAD",
+  "nivel": "resumen corto del nivel general (ej: Medio-Alto)",
+  "score": 0-100,
+  "resumen": "3-4 lineas integrando el portfolio con lo que pide el puesto",
+  "adecuacionAlPuesto": "que tan bien encaja el portfolio con ESTE puesto puntual",
+  "fortalezasVisuales": ["...", "..."],
+  "debilidades": ["...", "..."],
+  "preguntasSobrePortfolio": ["preguntas para la entrevista sobre el portfolio", "..."]
+}`;
+}
+
+function contextoPuesto(b) {
+  return 'PUESTO: ' + (b.puesto || '-') + ' — ' + (b.empresa || '-') + '\n' +
+    'COMPETENCIAS / PERFIL BUSCADO: ' + (b.competencias_clave || '-') + ' / ' + (b.soft_skills || '-') + '\n' +
+    'HARD SKILLS: ' + (b.hard_skills || '-');
+}
+
+// A) El consultor pega el texto de una evaluacion del portfolio real (ej: la que le
+//    genero Chrome + Claude mirando los videos). La IA la integra contra el puesto.
+async function analizarPortfolioTexto(observaciones, busqueda) {
+  const prompt = 'Un consultor reviso el PORTFOLIO real del candidato (online: Behance, web propia, reels, etc.) y dejo esta evaluacion. Integrala contra el puesto y devolve un veredicto de portfolio. NO inventes nada que no este en la evaluacion: basate en lo que dice.\n\n' +
+    contextoPuesto(busqueda) + '\n\n' +
+    'EVALUACION DEL PORTFOLIO (cargada por el consultor):\n' + String(observaciones || '').substring(0, 8000) + '\n\n' +
+    portfolioJSONSpec();
+  return await callClaude(prompt, 2000);
+}
+
+// B) El candidato mando el portfolio en PDF y la IA lo mira pagina por pagina.
+async function analizarPortfolioPDF(pdfBase64, busqueda) {
+  const prompt = 'Analiza el PORTFOLIO adjunto (PDF) pagina por pagina contra el puesto. Se critico y realista.\n\n' +
+    contextoPuesto(busqueda) + '\n\n' +
+    portfolioJSONSpec();
+  return await callClaudeDoc(pdfBase64, prompt, 2500);
+}
+
 async function analizarDISC(discTexto, busqueda, candidato) {
   const prompt = `Analiza la compatibilidad conductual (DISC) del candidato con el puesto.
- 
+
 PERFIL DISC ESPERADO PARA EL PUESTO: ${busqueda.perfil_disc || 'no especificado, inferir del puesto: ' + busqueda.puesto}
 COMPETENCIAS CLAVE: ${busqueda.competencias_clave || '-'}
 PUESTO: ${busqueda.puesto} en ${busqueda.empresa}
- 
+
 RESULTADO DISC DEL CANDIDATO (ProfileGame / Conductual 360):
 ${discTexto.substring(0, 6000)}
- 
+
 Devolve SOLO este JSON:
 {
   "compatibilidad": 0-100,
@@ -240,30 +319,30 @@ Devolve SOLO este JSON:
   "estiloGestion": "estilo de gestion/comunicacion recomendado con esta persona",
   "veredicto": "COMPATIBLE" | "COMPATIBLE CON OBSERVACIONES" | "BAJA COMPATIBILIDAD"
 }`;
- 
+
   return await callClaude(prompt, 2000);
 }
- 
+
 // ═══════════════════════════════════════
 // INFORME FINAL (tecnico + DISC + entrevista)
 // ═══════════════════════════════════════
 async function generarInformeFinal(candidato, busqueda) {
   const disc = candidato.disc_resultado ? JSON.parse(candidato.disc_resultado) : null;
   const prompt = `Genera el informe final integrado de este candidato para presentar al cliente.
- 
+
 PUESTO: ${busqueda.puesto} — ${busqueda.empresa}
- 
+
 SCORE TECNICO (CV vs puesto): ${candidato.score}/100 — ${candidato.recomendacion}
 RESUMEN TECNICO: ${candidato.resumen || '-'}
 FORTALEZAS: ${candidato.fortalezas || '[]'}
 BRECHAS: ${candidato.brechas || '[]'}
- 
+
 ANALISIS DISC: ${disc ? JSON.stringify(disc) : 'No realizado'}
 COMPATIBILIDAD DISC: ${candidato.disc_compatibilidad != null ? candidato.disc_compatibilidad + '/100' : 's/d'}
- 
+
 NOTAS DE LA ENTREVISTA (escritas por el consultor Hernan Salas):
 ${candidato.notas_entrevista || 'Sin entrevista registrada'}
- 
+
 Integra las tres capas (tecnica, conductual y la lectura humana del consultor). Devolve SOLO este JSON:
 {
   "scoreFinal": 0-100,
@@ -273,10 +352,10 @@ Integra las tres capas (tecnica, conductual y la lectura humana del consultor). 
   "puntosAtencion": ["...", "..."],
   "cierreConsultor": "parrafo final con la recomendacion de APTIA para el cliente, tono profesional"
 }`;
- 
+
   return await callClaude(prompt, 2500);
 }
- 
+
 // ═══════════════════════════════════════
 // EXTRAER TEXTO DE ADJUNTOS
 // ═══════════════════════════════════════
@@ -295,7 +374,7 @@ async function extraerTexto(attachment) {
   }
   return buffer.toString('utf-8');
 }
- 
+
 // ═══════════════════════════════════════
 // EMAIL - CONFIG
 // ═══════════════════════════════════════
@@ -306,20 +385,16 @@ const IMAP_CONFIG = {
   auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
   logger: false
 };
- 
-// Cuantos dias hacia atras lee el agente. Ignora leido/no-leido: el dedup real
-// lo hacen emails_procesados (message_id) + el hash del CV. Ajustable en Railway.
-const IMAP_SINCE_DAYS = parseInt(process.env.IMAP_SINCE_DAYS || '7', 10);
- 
+
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
 });
- 
+
 function colorScore(s) {
   return s >= 85 ? '🟢' : s >= 70 ? '🟡' : s >= 55 ? '🟠' : '🔴';
 }
- 
+
 async function enviarInforme(analisis, busqueda) {
   const scoreColor = colorScore(analisis.score);
   const preguntasHtml = (analisis.preguntasPreEntrevista || []).map(function (p) {
@@ -329,10 +404,10 @@ async function enviarInforme(analisis, busqueda) {
       '<p style="margin:2px 0 0;color:#FA8C8C;font-size:13px;">Red flag: ' + (p.redFlag || '') + '</p>' +
       '</div>';
   }).join('');
- 
+
   const recColor = analisis.recomendacion === 'AVANZAR' ? '#0E8A53'
     : analisis.recomendacion === 'NO AVANZAR' ? '#FA232B' : '#C77700';
- 
+
   const html =
     '<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;background:#001C52;color:#F4F6FB;padding:30px;border-radius:14px;">' +
       '<div style="border-bottom:2px solid #FA232B;padding-bottom:14px;margin-bottom:20px;">' +
@@ -354,7 +429,7 @@ async function enviarInforme(analisis, busqueda) {
         '<p style="color:#9FB2E0;font-size:12px;">aptiatalento.com</p>' +
       '</div>' +
     '</div>';
- 
+
   await transporter.sendMail({
     from: '"APTIA IA" <' + process.env.GMAIL_USER + '>',
     to: process.env.NOTIFY_EMAIL || process.env.GMAIL_USER,
@@ -363,7 +438,7 @@ async function enviarInforme(analisis, busqueda) {
   });
   console.log('📧 Informe enviado: ' + analisis.nombre + ' (' + analisis.score + '/100)');
 }
- 
+
 // ═══════════════════════════════════════
 // GUARDAR CANDIDATO ANALIZADO
 // ═══════════════════════════════════════
@@ -372,7 +447,17 @@ function hashCV(t) {
     .update(String(t || '').replace(/\s+/g, ' ').trim().toLowerCase())
     .digest('hex');
 }
- 
+
+// Guarda el archivo original del CV, indexado por el hash del texto.
+// INSERT OR IGNORE: si ese CV ya tiene archivo guardado, no lo pisa.
+function guardarArchivoCV(cvTexto, base64, nombre, mime) {
+  if (!base64) return;
+  try {
+    db.prepare('INSERT OR IGNORE INTO cv_archivos (cv_hash, nombre, mime, base64) VALUES (?, ?, ?, ?)')
+      .run(hashCV(cvTexto), nombre || 'cv', mime || 'application/octet-stream', base64);
+  } catch (e) { console.log('aviso archivo CV: ' + e.message); }
+}
+
 function guardarCandidato(busqueda_id, email_origen, cvTexto, analisis) {
   const stmt = db.prepare(`
     INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, cv_hash, score,
@@ -390,7 +475,7 @@ function guardarCandidato(busqueda_id, email_origen, cvTexto, analisis) {
   );
   return r.lastInsertRowid;
 }
- 
+
 // ═══════════════════════════════════════
 // COLA DE ANALISIS (worker en segundo plano)
 // El navegador solo encola; el server procesa de a uno, solo,
@@ -426,19 +511,19 @@ async function procesarCola() {
     colaActiva = false;
   }
 }
- 
+
 // ═══════════════════════════════════════
 // MONITOR DE EMAILS
 // ═══════════════════════════════════════
 let monitorActivo = false;
- 
+
 // Detecta el codigo de busqueda en el asunto: [APT-XXXX] o APT-XXXX
 function detectarCodigo(subject) {
   if (!subject) return null;
   const m = subject.toUpperCase().match(/APT-[A-Z0-9]{2,12}/);
   return m ? m[0] : null;
 }
- 
+
 async function revisarEmails() {
   if (monitorActivo) return;
   monitorActivo = true;
@@ -448,37 +533,34 @@ async function revisarEmails() {
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
     try {
-      const sinceDate = new Date(Date.now() - IMAP_SINCE_DAYS * 24 * 60 * 60 * 1000);
-      // Lee TODOS los mails desde sinceDate, esten leidos o no. Antes usaba
-      // { seen: false } y perdia para siempre cualquier mail abierto en Gmail.
-      const messages = client.fetch({ since: sinceDate }, { envelope: true, source: true, uid: true });
+      const messages = client.fetch({ seen: false }, { envelope: true, source: true, uid: true });
       for await (const msg of messages) {
         const messageId = msg.envelope.messageId;
         const exists = db.prepare('SELECT id FROM emails_procesados WHERE message_id = ?').get(messageId);
         if (exists) continue;
- 
+
         const parsed = await simpleParser(msg.source);
         const from = parsed.from && parsed.from.value && parsed.from.value[0] ? parsed.from.value[0].address : 'desconocido';
         const subject = parsed.subject || 'Sin asunto';
         console.log('\n📬 Nuevo email de: ' + from + ' | Asunto: ' + subject);
- 
+
         const attachments = (parsed.attachments || []).filter(function (a) {
           const name = (a.filename || '').toLowerCase();
           return name.endsWith('.pdf') || name.endsWith('.docx') || name.endsWith('.doc');
         });
- 
+
         // marcar procesado siempre
         function marcar() {
           db.prepare('INSERT OR IGNORE INTO emails_procesados (message_id, from_email, subject) VALUES (?, ?, ?)')
             .run(messageId, from, subject);
         }
- 
+
         if (attachments.length === 0) {
           console.log('   ⏭️  Sin CV adjunto, ignorando');
           marcar();
           continue;
         }
- 
+
         // 1) intentar por codigo en el asunto
         let busqueda = null;
         const codigo = detectarCodigo(subject);
@@ -486,7 +568,7 @@ async function revisarEmails() {
           busqueda = db.prepare("SELECT * FROM busquedas WHERE codigo = ? AND estado = 'activa'").get(codigo);
           if (busqueda) console.log('   🏷️  Codigo detectado: ' + codigo + ' -> ' + busqueda.puesto);
         }
- 
+
         // 2) si no hay codigo: si hay UNA sola busqueda activa, usar esa
         if (!busqueda) {
           const activas = db.prepare("SELECT * FROM busquedas WHERE estado = 'activa' ORDER BY created_at DESC").all();
@@ -499,34 +581,23 @@ async function revisarEmails() {
             console.log('   ⚠️  Varias busquedas activas y sin codigo -> CV sin asignar (revisar en panel)');
           }
         }
- 
+
         try {
           let cvTexto = '';
           for (const att of attachments) {
             cvTexto += '\n' + await extraerTexto(att);
           }
           if (!cvTexto.trim()) { console.log('   ⚠️  No se pudo extraer texto del CV'); marcar(); continue; }
- 
-          // Dedup por contenido: si este CV ya existe como candidato (cargado a mano,
-          // analizado antes, o guardado sin asignar), NO se reanaliza ni se duplica.
-          // Solo se marca el mail como procesado y se sigue.
-          const cvHash = hashCV(cvTexto);
-          const yaExiste = db.prepare('SELECT id FROM candidatos WHERE cv_hash = ?').get(cvHash);
-          if (yaExiste) {
-            console.log('   ⏭️  CV ya procesado antes (hash coincide), no se reanaliza');
-            marcar();
-            continue;
-          }
- 
+
           if (busqueda) {
             const analisis = await analizarCV(cvTexto, busqueda);
             guardarCandidato(busqueda.id, from, cvTexto, analisis);
             await enviarInforme(analisis, busqueda);
           } else {
             // guardar sin asignar para que Hernan lo ubique en el panel
-            db.prepare(`INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, cv_hash, estado_proceso)
-                        VALUES (NULL, ?, ?, ?, ?, 'Sin asignar')`)
-              .run((from.split('@')[0] || 'Candidato'), from, cvTexto.substring(0, 5000), cvHash);
+            db.prepare(`INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, estado_proceso)
+                        VALUES (NULL, ?, ?, ?, 'Sin asignar')`)
+              .run((from.split('@')[0] || 'Candidato'), from, cvTexto.substring(0, 5000));
             console.log('   📥 CV guardado sin asignar');
           }
           marcar();
@@ -545,11 +616,11 @@ async function revisarEmails() {
     monitorActivo = false;
   }
 }
- 
+
 // ═══════════════════════════════════════
 // API
 // ═══════════════════════════════════════
- 
+
 // Generar codigo unico tipo APT-XXXX
 function generarCodigo(puesto) {
   const base = (puesto || 'BUS').toUpperCase().replace(/[^A-Z]/g, '').substring(0, 4) || 'BUS';
@@ -561,7 +632,7 @@ function generarCodigo(puesto) {
   } while (db.prepare('SELECT id FROM busquedas WHERE codigo = ?').get(codigo) && intentos < 20);
   return codigo;
 }
- 
+
 // Crear busqueda
 app.post('/api/busquedas', (req, res) => {
   const b = req.body || {};
@@ -578,18 +649,18 @@ app.post('/api/busquedas', (req, res) => {
   const r = stmt.run.apply(stmt, vals);
   res.json({ id: r.lastInsertRowid, codigo: codigo });
 });
- 
+
 // Listar busquedas (todas, para el panel)
 app.get('/api/busquedas/all', (req, res) => {
   res.json(db.prepare('SELECT * FROM busquedas ORDER BY created_at DESC').all());
 });
- 
+
 // Listar busquedas activas PARA LA WEB (solo las publicables)
 app.get('/api/busquedas', (req, res) => {
   const rows = db.prepare("SELECT id, codigo, empresa, area, puesto, ubicacion, modalidad, jornada FROM busquedas WHERE estado = 'activa' AND publicar_web = 1 ORDER BY created_at DESC").all();
   res.json(rows);
 });
- 
+
 // Cambiar estado de busqueda (activa / cerrada)
 app.patch('/api/busquedas/:id', (req, res) => {
   const { estado, publicar_web } = req.body || {};
@@ -597,26 +668,38 @@ app.patch('/api/busquedas/:id', (req, res) => {
   if (publicar_web !== undefined) db.prepare('UPDATE busquedas SET publicar_web = ? WHERE id = ?').run(publicar_web ? 1 : 0, req.params.id);
   res.json({ ok: true });
 });
- 
+
 // Listar candidatos (opcional por busqueda)
 app.get('/api/candidatos', (req, res) => {
   const { busqueda_id } = req.query;
   let rows;
   if (busqueda_id) {
-    rows = db.prepare('SELECT * FROM candidatos WHERE busqueda_id = ? ORDER BY COALESCE(score_final, score, 0) DESC').all(busqueda_id);
+    rows = db.prepare('SELECT candidatos.*, (SELECT nombre FROM cv_archivos WHERE cv_hash = candidatos.cv_hash) AS cv_archivo_nombre FROM candidatos WHERE busqueda_id = ? ORDER BY COALESCE(score_final, score, 0) DESC').all(busqueda_id);
   } else {
-    rows = db.prepare('SELECT * FROM candidatos ORDER BY created_at DESC').all();
+    rows = db.prepare('SELECT candidatos.*, (SELECT nombre FROM cv_archivos WHERE cv_hash = candidatos.cv_hash) AS cv_archivo_nombre FROM candidatos ORDER BY created_at DESC').all();
   }
   rows = rows.map(parseCand);
   res.json(rows);
 });
- 
+
 app.get('/api/candidatos/:id', (req, res) => {
-  const row = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(req.params.id);
+  const row = db.prepare('SELECT candidatos.*, (SELECT nombre FROM cv_archivos WHERE cv_hash = candidatos.cv_hash) AS cv_archivo_nombre FROM candidatos WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'No encontrado' });
   res.json(parseCand(row));
 });
- 
+
+// Servir el archivo original del CV (para abrir en solo lectura en el panel)
+app.get('/api/candidatos/:id/archivo', (req, res) => {
+  const c = db.prepare('SELECT cv_hash FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!c || !c.cv_hash) return res.status(404).json({ error: 'Sin archivo' });
+  const f = db.prepare('SELECT nombre, mime, base64 FROM cv_archivos WHERE cv_hash = ?').get(c.cv_hash);
+  if (!f || !f.base64) return res.status(404).json({ error: 'Sin archivo' });
+  const buf = Buffer.from(f.base64, 'base64');
+  res.setHeader('Content-Type', f.mime || 'application/octet-stream');
+  res.setHeader('Content-Disposition', 'inline; filename="' + String(f.nombre || 'cv').replace(/"/g, '') + '"');
+  res.send(buf);
+});
+
 function parseCand(r) {
   return Object.assign({}, r, {
     fortalezas: JSON.parse(r.fortalezas || '[]'),
@@ -624,17 +707,19 @@ function parseCand(r) {
     excluyentes_no_cumplidos: JSON.parse(r.excluyentes_no_cumplidos || '[]'),
     preguntas: JSON.parse(r.preguntas || '[]'),
     disc_resultado: r.disc_resultado ? safeParse(r.disc_resultado) : null,
-    informe_final: r.informe_final ? safeParse(r.informe_final) : null
+    informe_final: r.informe_final ? safeParse(r.informe_final) : null,
+    portfolio_analisis: r.portfolio_analisis ? safeParse(r.portfolio_analisis) : null
   });
 }
 function safeParse(s) { try { return JSON.parse(s); } catch (e) { return s; } }
- 
+
 // Analisis manual de CV (lo sube Hernan eligiendo busqueda)
 app.post('/api/analizar', async (req, res) => {
   const { busqueda_id, cv_texto, candidato_id } = req.body || {};
   if (!busqueda_id || !cv_texto) return res.status(400).json({ error: 'Faltan datos' });
   const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(busqueda_id);
   if (!busqueda) return res.status(404).json({ error: 'Busqueda no encontrada' });
+  guardarArchivoCV(cv_texto, req.body.archivo_base64, req.body.archivo_nombre, req.body.archivo_mime);
   try {
     const analisis = await analizarCV(cv_texto, busqueda);
     let id;
@@ -659,7 +744,7 @@ app.post('/api/analizar', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 // Cargar resultado DISC y calcular compatibilidad
 app.post('/api/candidatos/:id/disc', async (req, res) => {
   const { disc_texto } = req.body || {};
@@ -676,7 +761,7 @@ app.post('/api/candidatos/:id/disc', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 // Guardar notas de entrevista
 app.post('/api/candidatos/:id/entrevista', (req, res) => {
   const { notas } = req.body || {};
@@ -685,8 +770,38 @@ app.post('/api/candidatos/:id/entrevista', (req, res) => {
     .run(notas, req.params.id);
   res.json({ ok: true });
 });
- 
+
 // Generar informe final integrado
+// Portfolio: A) texto pegado (ej. la devolucion del Chrome), B) PDF, o {} para limpiar
+app.post('/api/candidatos/:id/portfolio', async (req, res) => {
+  const cand = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Candidato no encontrado' });
+  const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(cand.busqueda_id) || {};
+  const obs = req.body && req.body.observaciones ? String(req.body.observaciones).trim() : '';
+  const pdf = req.body && req.body.pdf_base64 ? req.body.pdf_base64 : '';
+
+  if (!obs && !pdf) {
+    db.prepare('UPDATE candidatos SET portfolio_analisis = NULL, portfolio_score = NULL WHERE id = ?').run(req.params.id);
+    return res.json({ ok: true, cleared: true });
+  }
+  try {
+    let analisis, origen;
+    if (pdf) {
+      analisis = await analizarPortfolioPDF(pdf, busqueda);
+      origen = 'Portfolio en PDF, analizado por la IA';
+    } else {
+      analisis = await analizarPortfolioTexto(obs, busqueda);
+      origen = 'Portfolio revisado — evaluacion cargada por el consultor';
+    }
+    analisis.origen = origen;
+    db.prepare('UPDATE candidatos SET portfolio_analisis = ?, portfolio_score = ? WHERE id = ?')
+      .run(JSON.stringify(analisis), (analisis.score != null ? analisis.score : null), req.params.id);
+    res.json(analisis);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/candidatos/:id/informe-final', async (req, res) => {
   const cand = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(req.params.id);
   if (!cand) return res.status(404).json({ error: 'Candidato no encontrado' });
@@ -700,13 +815,13 @@ app.post('/api/candidatos/:id/informe-final', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 // Borrar candidato
 app.delete('/api/candidatos/:id', (req, res) => {
   db.prepare('DELETE FROM candidatos WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
- 
+
 // Stats
 app.get('/api/stats', (req, res) => {
   const { busqueda_id } = req.query;
@@ -717,39 +832,40 @@ app.get('/api/stats', (req, res) => {
   const activas = db.prepare("SELECT COUNT(*) t FROM busquedas WHERE estado = 'activa'").get().t;
   res.json({ candidatos, avanzar, activas, scorePromedio: Math.round(prom) });
 });
- 
+
 // Forzar revision de mails
 app.post('/api/monitor/check', async (req, res) => {
   revisarEmails();
   res.json({ message: 'Revision disparada' });
 });
- 
+
 // Encolar un lote de CVs (no bloquea; el worker los procesa en segundo plano)
 app.post('/api/cola/agregar', (req, res) => {
   const { busqueda_id, cvs } = req.body || {};
   if (!busqueda_id || !Array.isArray(cvs)) return res.status(400).json({ error: 'Faltan busqueda_id o cvs' });
   const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(busqueda_id);
   if (!busqueda) return res.status(404).json({ error: 'Busqueda no encontrada' });
- 
+
   let encolados = 0, duplicados = 0, vacios = 0;
   const insert = db.prepare("INSERT INTO cola (busqueda_id, nombre_archivo, cv_texto, cv_hash, estado) VALUES (?, ?, ?, ?, 'pendiente')");
- 
+
   for (const cv of cvs) {
     const texto = (cv && cv.texto ? String(cv.texto) : '').trim();
     const nombre = cv && cv.nombre ? String(cv.nombre) : 'CV';
     if (texto.length < 80) { vacios++; continue; }
     const h = hashCV(texto);
+    guardarArchivoCV(texto, cv.archivo_base64, nombre, cv.archivo_mime);
     const yaCand = db.prepare('SELECT id FROM candidatos WHERE busqueda_id = ? AND cv_hash = ?').get(busqueda_id, h);
     const yaCola = db.prepare("SELECT id FROM cola WHERE busqueda_id = ? AND cv_hash = ? AND estado IN ('pendiente','procesando')").get(busqueda_id, h);
     if (yaCand || yaCola) { duplicados++; continue; }
     insert.run(busqueda_id, nombre, texto, h);
     encolados++;
   }
- 
+
   setTimeout(procesarCola, 200);
   res.json({ encolados, duplicados, vacios });
 });
- 
+
 // Estado de la cola (para que el panel muestre el progreso sin manejar el trabajo)
 app.get('/api/cola/estado', (req, res) => {
   const { busqueda_id } = req.query;
@@ -760,7 +876,7 @@ app.get('/api/cola/estado', (req, res) => {
   const items = db.prepare('SELECT id, nombre_archivo, estado, error, candidato_id FROM cola' + where + ' ORDER BY id DESC LIMIT 300').all();
   res.json({ resumen, items });
 });
- 
+
 // Limpiar de la cola los que ya terminaron (listos y errores) de una busqueda
 app.post('/api/cola/limpiar', (req, res) => {
   const { busqueda_id } = req.body || {};
@@ -768,20 +884,19 @@ app.post('/api/cola/limpiar', (req, res) => {
   db.prepare("DELETE FROM cola WHERE estado IN ('listo','error')" + where).run();
   res.json({ ok: true });
 });
- 
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.2.0' }));
+
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.3.0-cv-pf' }));
 app.get('/', (req, res) => res.json({ service: 'APTIA agente', estado: 'online', endpoints: ['/api/busquedas', '/api/candidatos', '/api/stats'] }));
- 
+
 // ═══════════════════════════════════════
 // ARRANQUE
 // ═══════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '120000', 10);
- 
+
 app.listen(PORT, () => {
-  console.log('🚀 APTIA server v2.2.0 escuchando en puerto ' + PORT);
+  console.log('🚀 APTIA server v2.3.0-cv-pf escuchando en puerto ' + PORT);
   console.log('📨 Monitor de Gmail cada ' + (CHECK_INTERVAL / 1000) + 's');
-  console.log('📅 Lectura IMAP: ultimos ' + IMAP_SINCE_DAYS + ' dias (ignora leido/no-leido)');
   console.log('⚙️  Worker de cola activo (procesa CVs en segundo plano)');
   setTimeout(revisarEmails, 5000);
   setInterval(revisarEmails, CHECK_INTERVAL);
