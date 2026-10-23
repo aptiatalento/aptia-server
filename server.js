@@ -175,7 +175,8 @@ ensureColumn('candidatos', 'lectura_version', 'TEXT');
 ensureColumn('cola', 'pdf_alertas', 'TEXT');
 ensureColumn('busquedas', 'perfil_calibrado', 'TEXT');   // analisis del puesto (requisitos, criticidad, anclas, perfil DISC)
 ensureColumn('busquedas', 'notas_perfil', 'TEXT');       // lo que el cliente valora o descarta (aprendizajes de la busqueda)
-ensureColumn('candidatos', 'referencias', 'TEXT');       // notas de las llamadas de referencia
+ensureColumn('candidatos', 'referencias', 'TEXT');
+ensureColumn('candidatos', 'seguimiento', 'TEXT');        // v2.7.1: casillas del consultor (contactado, DISC enviado, entrevista)       // notas de las llamadas de referencia
 // Los CV que quedaron "procesando" por un reinicio vuelven a la cola (antes quedaban trabados para siempre)
 try { db.prepare("UPDATE cola SET estado='pendiente' WHERE estado='procesando'").run(); } catch (e) {}
 
@@ -2654,6 +2655,7 @@ function parseCand(r) {
     disc_resultado: r.disc_resultado ? safeParse(r.disc_resultado) : null,
     informe_final: r.informe_final ? safeParse(r.informe_final) : null,
     portfolio_analisis: r.portfolio_analisis ? safeParse(r.portfolio_analisis) : null,
+    seguimiento: r.seguimiento ? safeParse(r.seguimiento) : {},
     guia_entrevista: r.guia_entrevista ? safeParse(r.guia_entrevista) : null,
     cv_lectura: r.cv_lectura ? safeParse(r.cv_lectura) : null,
     integridad: r.integridad ? safeParse(r.integridad) : null,
@@ -2828,6 +2830,19 @@ app.post('/api/candidatos/:id/referencias', (req, res) => {
   const cambio = String(antes.referencias || '').trim() !== texto;
   const programado = cambio ? programarInforme(req.params.id, 'referencias') : false;
   res.json({ ok: true, informe: programado ? 'actualizando' : 'sin cambios' });
+});
+
+// Seguimiento del consultor: casillas de en que paso esta cada candidato. No toca el score.
+const PASOS_SEGUIMIENTO = ['contactado', 'disc', 'entrevista'];
+app.post('/api/candidatos/:id/seguimiento', (req, res) => {
+  const { paso, marcado } = req.body || {};
+  if (!PASOS_SEGUIMIENTO.includes(paso)) return res.status(400).json({ error: 'Paso invalido' });
+  const c = db.prepare('SELECT seguimiento FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Candidato no encontrado' });
+  const s = (c.seguimiento && safeParse(c.seguimiento)) || {};
+  if (marcado) s[paso] = true; else delete s[paso];
+  db.prepare('UPDATE candidatos SET seguimiento = ? WHERE id = ?').run(JSON.stringify(s), req.params.id);
+  res.json(s);
 });
 
 // Generar informe final integrado
@@ -3059,7 +3074,7 @@ app.post('/api/cola/limpiar', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.7.0', lecturaCV: LECTURA_CV, clave: !!APTIA_KEY }));
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.7.1', lecturaCV: LECTURA_CV, clave: !!APTIA_KEY }));
 app.get('/', (req, res) => res.json({ service: 'APTIA agente', estado: 'online', endpoints: ['/api/busquedas', '/api/candidatos', '/api/stats'] }));
 
 // ═══════════════════════════════════════
@@ -3069,7 +3084,7 @@ const PORT = process.env.PORT || 3000;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '120000', 10);
 
 app.listen(PORT, () => {
-  console.log('🚀 APTIA server v2.7.0 escuchando en puerto ' + PORT + ' · lectura de CV: ' + LECTURA_CV + ' · clave del panel: ' + (APTIA_KEY ? 'ACTIVA' : 'NO configurada (server abierto)'));
+  console.log('🚀 APTIA server v2.7.1 escuchando en puerto ' + PORT + ' · lectura de CV: ' + LECTURA_CV + ' · clave del panel: ' + (APTIA_KEY ? 'ACTIVA' : 'NO configurada (server abierto)'));
   console.log('📨 Monitor de Gmail cada ' + (CHECK_INTERVAL / 1000) + 's');
   console.log('⚙️  Worker de cola activo (procesa CVs en segundo plano)');
   setTimeout(revisarEmails, 5000);
