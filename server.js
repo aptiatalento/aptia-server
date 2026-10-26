@@ -8,33 +8,94 @@ const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '150mb' })); // sube el limite: ahora tambien viaja el archivo original del CV (base64)
+app.disable('x-powered-by');
+// v2.8.2: un error en una ruta async ya no puede tirar abajo el server (se responde con un error prolijo)
+['get', 'post', 'patch', 'put', 'delete'].forEach(m => {
+  const orig = app[m].bind(app);
+  app[m] = (ruta, ...hs) => hs.length ? orig(ruta, ...hs.map(h => typeof h === 'function' && h.constructor && h.constructor.name === 'AsyncFunction'
+    ? (req, res, next) => h(req, res, next).catch(next) : h)) : orig(ruta);
+});
+// CORS: abierto por defecto (el panel y la web estan en otros dominios). Con CORS_ORIGINS="https://a.com,https://b.com" se limita.
+const ORIGENES = String(process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
+app.use(cors(ORIGENES.length ? { origin: ORIGENES } : {}));
 
 // ═══════════════════════════════════════
 // CLAVE DEL PANEL
-// Si en Railway existe la variable APTIA_KEY, todo /api/* pide esa clave
-// (header x-aptia-key, o ?k= para abrir el CV original en otra pestaña).
-// Quedan publicos solo: GET /api/busquedas (la web), /api/health y /api/auth.
-// Sin APTIA_KEY el server funciona abierto como hasta ahora (para no romper nada al deployar).
+// Todo /api/* pide la clave APTIA_KEY (header x-aptia-key). Quedan publicos solo: GET /api/busquedas (la web),
+// /api/health, /api/auth y los links firmados (vencen en pocos minutos) para ver un CV o bajar la copia de seguridad.
+// v2.8.2:
+// - Sin APTIA_KEY el server NO atiende (antes quedaba abierto). Solo para pruebas locales: APTIA_SIN_CLAVE=1.
+// - Muchos intentos con una clave incorrecta desde la misma IP bloquean esa IP 15 minutos (antes se podia probar sin limite).
+// - La clave ya no viaja en la URL (?k=): el CV original se abre con un link firmado que vence en 30 minutos.
+// - Los pedidos se leen DESPUES de validar la clave (antes alguien sin clave podia mandar 150 MB y saturar el server).
 // ═══════════════════════════════════════
 const APTIA_KEY = String(process.env.APTIA_KEY || '').trim();
+const SIN_CLAVE_PERMITIDO = String(process.env.APTIA_SIN_CLAVE || '') === '1';
 function claveOk(k) {
-  if (!APTIA_KEY) return true;
+  if (!APTIA_KEY) return SIN_CLAVE_PERMITIDO;
   const a = Buffer.from(String(k || '').trim().toLowerCase()), b = Buffer.from(APTIA_KEY.toLowerCase());
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+const FALLOS_CLAVE = new Map(), VENTANA_FALLOS = 15 * 60 * 1000, MAX_FALLOS = 40;
+// IP real del que pide. En Railway la escribe el borde de la red (X-Real-IP / primer valor de X-Forwarded-For);
+// no se usa "trust proxy" porque detras de la CDN de Railway devolveria la IP de la CDN, compartida por todos.
+function ipDe(req) {
+  const real = String(req.get('x-real-ip') || '').trim();
+  if (real) return real.substring(0, 64);
+  const xff = String(req.get('x-forwarded-for') || '').split(',')[0].trim();
+  return (xff || String((req.socket && req.socket.remoteAddress) || '?')).substring(0, 64);
+}
+function ipBloqueada(ip) {
+  const f = FALLOS_CLAVE.get(ip);
+  if (!f) return false;
+  if (Date.now() - f.desde > VENTANA_FALLOS) { FALLOS_CLAVE.delete(ip); return false; }
+  return f.n >= MAX_FALLOS;
+}
+function registrarFallo(ip) {
+  const f = FALLOS_CLAVE.get(ip);
+  if (!f || Date.now() - f.desde > VENTANA_FALLOS) FALLOS_CLAVE.set(ip, { n: 1, desde: Date.now() });
+  else if (++f.n === MAX_FALLOS) console.log('🔒 ' + MAX_FALLOS + ' intentos con clave incorrecta desde ' + ip + ': esa IP queda bloqueada 15 minutos');
+  if (FALLOS_CLAVE.size > 50000) FALLOS_CLAVE.clear();   // tope de memoria ante un ataque desde miles de IPs
+}
+setInterval(() => { const ahora = Date.now(); for (const [ip, f] of FALLOS_CLAVE) if (ahora - f.desde > VENTANA_FALLOS) FALLOS_CLAVE.delete(ip); }, VENTANA_FALLOS).unref();
+const RUTAS_FIRMADAS = /^\/(archivo\/\d+|backup\/descargar)$/;
 app.use('/api', (req, res, next) => {
-  const publico = (req.method === 'GET' && (req.path === '/busquedas' || req.path === '/health')) || req.path === '/auth';
-  if (publico || claveOk(req.get('x-aptia-key') || req.query.k)) return next();
+  const publico = (req.method === 'GET' && (req.path === '/busquedas' || req.path === '/health' || RUTAS_FIRMADAS.test(req.path))) || req.path === '/auth';
+  if (publico) return next();
+  const ip = ipDe(req);
+  if (ipBloqueada(ip)) return res.status(429).json({ error: 'Demasiados intentos con una clave incorrecta. Espera 15 minutos y volve a entrar.' });
+  if (!APTIA_KEY && !SIN_CLAVE_PERMITIDO) return res.status(503).json({ error: 'El servidor no tiene clave configurada (variable APTIA_KEY en Railway).' });
+  if (claveOk(req.get('x-aptia-key'))) return next();
+  registrarFallo(ip);
   res.status(401).json({ error: 'Clave incorrecta o vencida. Volve a entrar al panel.' });
 });
-app.post('/api/auth', (req, res) => {
-  const k = req.body && req.body.clave;
-  res.json({ requerida: !!APTIA_KEY, ok: claveOk(k) });
+app.post('/api/auth', express.json({ limit: '10kb' }), (req, res) => {
+  const ip = ipDe(req);
+  if (ipBloqueada(ip)) return res.status(429).json({ error: 'Demasiados intentos con una clave incorrecta. Espera 15 minutos.' });
+  const ok = claveOk(req.body && req.body.clave);
+  if (ok) FALLOS_CLAVE.delete(ip); else registrarFallo(ip);
+  res.json({ requerida: true, ok, sinClaveEnServidor: !APTIA_KEY && !SIN_CLAVE_PERMITIDO });
 });
+// recien ahora se lee el cuerpo de los pedidos (ya autorizados): puede traer el archivo del CV en base64
+const leerJSON = express.json({ limit: '150mb' });
+app.use((req, res, next) => (req.method === 'GET' || req.method === 'HEAD') ? next() : leerJSON(req, res, next));
+
+// Links firmados (sin la clave en la URL) para abrir un archivo en otra pestaña o bajar la copia de seguridad
+const SECRETO_LINKS = crypto.createHash('sha256').update('aptia-links|' + (APTIA_KEY || crypto.randomBytes(24).toString('hex'))).digest();
+function firmaLink(tipo, id, exp) { return crypto.createHmac('sha256', SECRETO_LINKS).update(tipo + '|' + id + '|' + exp).digest('hex').substring(0, 40); }
+function linkFirmado(tipo, id, ruta, minutos) {
+  const exp = Date.now() + (minutos || 10) * 60 * 1000;
+  return ruta + (ruta.includes('?') ? '&' : '?') + 'e=' + exp + '&f=' + firmaLink(tipo, id, exp);
+}
+function linkValido(tipo, id, req) {
+  const exp = Number(req.query.e), f = String(req.query.f || ''), esperado = firmaLink(tipo, id, exp);
+  return Number.isFinite(exp) && exp > Date.now() && f.length === esperado.length && crypto.timingSafeEqual(Buffer.from(f), Buffer.from(esperado));
+}
 
 // ═══════════════════════════════════════
 // BASE DE DATOS
@@ -176,9 +237,18 @@ ensureColumn('cola', 'pdf_alertas', 'TEXT');
 ensureColumn('busquedas', 'perfil_calibrado', 'TEXT');   // analisis del puesto (requisitos, criticidad, anclas, perfil DISC)
 ensureColumn('busquedas', 'notas_perfil', 'TEXT');       // lo que el cliente valora o descarta (aprendizajes de la busqueda)
 ensureColumn('candidatos', 'referencias', 'TEXT');
-ensureColumn('candidatos', 'seguimiento', 'TEXT');        // v2.7.1: casillas del consultor (contactado, DISC enviado, entrevista)       // notas de las llamadas de referencia
+ensureColumn('candidatos', 'seguimiento', 'TEXT');        // v2.7.1: casillas del consultor (contactado, DISC enviado, entrevista)
+ensureColumn('candidatos', 'correcciones_entrevista', 'TEXT');  // v2.7.2: lo que el consultor corrigio de la clasificacion de la IA
+ensureColumn('candidatos', 'informe_textos', 'TEXT');          // v2.8: textos del informe editados a mano por el consultor
+ensureColumn('cola', 'email_origen', 'TEXT');              // v2.8.2: CV que llego por mail y la IA no pudo analizar en el momento
+ensureColumn('cola', 'intentos', 'INTEGER DEFAULT 0');     // v2.8.2: reintentos automaticos si la IA estaba saturada
+ensureColumn('cola', 'reintentar_despues', 'INTEGER');     // v2.8.2: cuando toca el proximo reintento automatico (ms)
+db.exec('CREATE TABLE IF NOT EXISTS meta (clave TEXT PRIMARY KEY, valor TEXT)');
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_cand_busqueda ON candidatos (busqueda_id)'); db.exec('CREATE INDEX IF NOT EXISTS idx_cand_hash ON candidatos (cv_hash)'); db.exec('CREATE INDEX IF NOT EXISTS idx_cola_estado ON cola (estado)'); } catch (e) {}
 // Los CV que quedaron "procesando" por un reinicio vuelven a la cola (antes quedaban trabados para siempre)
 try { db.prepare("UPDATE cola SET estado='pendiente' WHERE estado='procesando'").run(); } catch (e) {}
+// v2.8.2: la cola ya no guarda una segunda copia del CV de los que ya se analizaron (queda solo en la ficha del candidato)
+try { db.prepare("UPDATE cola SET cv_texto=NULL WHERE estado='listo' AND candidato_id IS NOT NULL AND cv_texto IS NOT NULL").run(); } catch (e) {}
 
 // ═══════════════════════════════════════
 // CLAUDE API
@@ -453,38 +523,59 @@ const PUNTOS_REQ = {
   blando: { 'CUMPLE': 1, 'PARCIAL': 0.6, 'NO CUMPLE': 0.1, 'SIN DATOS': 0.4 }
 };
 const PESO_CRITICIDAD = { CORE: 3, IMPORTANTE: 2, COMPLEMENTARIO: 1 };
+// Algo que el CV solo declara (sin un trabajo que lo respalde) vale como PARCIAL hasta que la entrevista lo muestre
+// (v2.8.1: vuelve al criterio riguroso original; la entrevista es la que lo sube a cumple).
 const FACTOR_VIGENCIA = { ACTUAL: 1, RECIENTE: 0.9, ANTIGUA: 0.7, 'NO APLICA': 1 };
 const TOPE_EXCLUYENTE = 40;
 
+// v2.8: "Indistinto", "No importa", "No excluyente" no son requisitos. Antes "Idioma: Indistinto" quedaba como
+// requisito y restaba como "no surge del CV", y "Experiencia minima: No importa el tiempo" quedaba como central.
+const RE_VALOR_VACIO = /^(indistint[oa]s?|no excluyentes?|no importa\b.*|no es (necesari[oa]|excluyente|requisito|indispensable)\b.*|no (se )?requiere\b.*|no requerid[oa]s?|no aplica|n a|na|s d|ningun[oa]?|cualquiera|sin (requisitos?|preferencias?|exigencias?)\b.*|no hace falta\b.*|a convenir|libre|no)$/;
+function esValorVacio(t) { const n = normalizar(t); return !n || RE_VALOR_VACIO.test(n); }
+function esRequisitoVacio(texto) { return esValorVacio(String(texto || '').replace(/^[^:]{1,30}:\s*/, '')); }
+
 function separarLista(t, soloLineas) {
   const s = String(t || '').trim();
-  if (!s || /^(-|no|n\/a|ninguno|ninguna|s\/d)$/i.test(s)) return [];
+  if (!s || esValorVacio(s)) return [];
   let partes = s.split(/\r?\n|;/);
   if (!soloLineas || partes.length === 1) partes = partes.flatMap(p => p.split(/,|\s\/\s|•|·/));
-  return partes.map(p => p.replace(/^[\s\-–*•\d.)]+/, '').trim()).filter(p => p.length > 1).slice(0, 15);
+  return partes.map(p => p.replace(/^[\s\-–*•\d.)]+/, '').trim()).filter(p => p.length > 1 && !esValorVacio(p)).slice(0, 15);
 }
 
 // Requisitos armados directo de los campos de la busqueda (base y respaldo si la calibracion falla)
 function armarRequisitosBase(b) {
   const req = [];
   const add = (cat, texto, criticidad, origen, plus, clave) => req.push({ cat, texto, criticidad, origen, plus: !!plus, clave: clave || null });
-  if (b.formacion_minima) add('formacion', 'Formacion minima: ' + b.formacion_minima, 'IMPORTANTE', 'formacion_minima');
+  const dato = v => !!String(v || '').trim() && !esValorVacio(v);
+  if (dato(b.formacion_minima)) add('formacion', 'Formacion minima: ' + b.formacion_minima, 'IMPORTANTE', 'formacion_minima');
   separarLista(b.certificaciones).forEach(x => add('formacion', 'Certificacion: ' + x, 'IMPORTANTE', 'certificaciones'));
   separarLista(b.idiomas).forEach(x => add('formacion', 'Idioma: ' + x, 'IMPORTANTE', 'idiomas'));
-  if (b.formacion_deseable) add('formacion', 'Formacion deseable: ' + b.formacion_deseable, 'COMPLEMENTARIO', 'formacion_deseable', true);
-  if (b.experiencia_minima) add('experiencia', 'Experiencia minima: ' + b.experiencia_minima, 'CORE', 'experiencia_minima', false, 'exp_min');
+  if (dato(b.formacion_deseable)) add('formacion', 'Formacion deseable: ' + b.formacion_deseable, 'COMPLEMENTARIO', 'formacion_deseable', true);
+  if (dato(b.experiencia_minima)) add('experiencia', 'Experiencia minima: ' + b.experiencia_minima, 'CORE', 'experiencia_minima', false, 'exp_min');
   add('experiencia', 'Experiencia en tareas equivalentes a las del puesto (' + (b.puesto || 'puesto') + (b.area ? ', ' + b.area : '') + ')', 'CORE', 'sistema', false, 'tareas');
-  if (b.industrias_valoradas) add('experiencia', 'Experiencia en industrias valoradas: ' + b.industrias_valoradas, 'COMPLEMENTARIO', 'industrias_valoradas', true);
+  if (dato(b.industrias_valoradas)) add('experiencia', 'Experiencia en industrias valoradas: ' + b.industrias_valoradas, 'COMPLEMENTARIO', 'industrias_valoradas', true);
   separarLista(b.hard_skills).forEach(x => add('hardSkills', x, 'IMPORTANTE', 'hard_skills'));
   separarLista(b.soft_skills).forEach(x => add('softSkills', x, 'IMPORTANTE', 'soft_skills'));
   separarLista(b.competencias_clave).forEach(x => add('softSkills', 'Competencia: ' + x, 'IMPORTANTE', 'competencias_clave'));
+  // v2.7.2: una competencia cargada como excluyente se puntua como competencia central (no excluye)
+  separarLista(b.deal_breakers, true).filter(esCompetenciaBlanda).forEach(x => add('softSkills', 'Competencia: ' + x, 'CORE', 'deal_breakers'));
   if (b.ubicacion || b.modalidad) add('fitCultural', 'Ubicacion compatible con ' + (b.ubicacion || '-') + ' / modalidad ' + (b.modalidad || '-'), 'IMPORTANTE', 'sistema', false, 'ubicacion');
   add('fitCultural', 'Trayectoria estable (permanencia en los trabajos)', 'COMPLEMENTARIO', 'sistema', false, 'estabilidad');
   add('fitCultural', 'Nivel de seniority acorde al puesto', 'COMPLEMENTARIO', 'sistema', false, 'seniority');
   return {
     requisitos: req.map((r, i) => Object.assign({ id: 'R' + (i + 1), tipo: TIPO_CATEGORIA[r.cat], ancla: null }, r)),
-    excluyentes: separarLista(b.deal_breakers, true).map((x, i) => ({ id: 'X' + (i + 1), texto: x, comoSeVerifica: '' }))
+    excluyentes: separarLista(b.deal_breakers, true).filter(x => !esCompetenciaBlanda(x)).map((x, i) => ({ id: 'X' + (i + 1), texto: x, comoSeVerifica: '' }))
   };
+}
+
+// v2.7.2: competencias puestas como excluyentes ("vocacion de servicio", "paciencia", "que le importen las personas").
+// Una competencia se puntua en escala: no puede dejar a alguien afuera por "no confirmada". Un excluyente real es una
+// condicion que se verifica con un dato: horario, zona, movilidad, titulo, matricula, idioma, años de experiencia, etc.
+const RE_CONDICION = /\b(disponib\w*|sabados?|domingos?|feriados?|fines? de semana|horari\w*|turnos?|rotativ\w*|nocturn\w*|full ?time|part ?time|jornada|zona|vivir|viva|resid\w*|cerca|distancia|movilidad|auto|vehiculo|moto|licencia|registro|carnet|titulo|titulad\w*|matricul\w*|recibid\w*|graduad\w*|egresad\w*|universitari\w*|terciari\w*|secundari\w*|estudios|anos|ano|meses|experiencia|idiomas?|ingles|portugues|certific\w*|antecedentes|monotribut\w*|factur\w*|salari\w*|sueldo|remuneracion|pretension\w*|viaj\w*|presencial\w*|remoto|hibrid\w*|mudar\w*|reubic\w*|inmediat\w*|excel|sap|sistemas?|herramientas?|software)\b/;
+const RE_COMPETENCIA = /\b(vocacion|paciencia|pacientes?|empati\w*|importe|importen|importa|importan|interes|sensib\w*|sentimientos?|sienta|calidez|calid[oa]s?|carisma|amable|amables|amabilidad|cordial\w*|simpati\w*|trato|actitud|predisposicion|motivacion|motivad[oa]s?|compromiso|comprometid[oa]s?|pasion|ganas|entusiasm\w*|energia|dinamism\w*|proactiv\w*|iniciativa|responsab\w*|honest\w*|etica|etico|integridad|valores|lealtad|liderazgo|lider|comunicacion|comunicativ\w*|oratoria|escucha|negociacion|persuasion|trabajo en equipo|colaborativ\w*|orientacion|resiliencia|tolerancia|frustracion|presion|adaptab\w*|flexib\w*|organizad[oa]s?|prolij\w*|detallista|perseveran\w*|constancia|creativ\w*|autonom\w*|criterio|madurez|humildad|respeto|respetuos[oa]s?|personas|gente)\b/;
+function esCompetenciaBlanda(texto) {
+  const t = normalizar(texto);
+  return !!t && RE_COMPETENCIA.test(t) && !RE_CONDICION.test(t);
 }
 
 // ───────── Avisos sobre la busqueda (requisitos discriminatorios o mal ubicados) ─────────
@@ -512,6 +603,7 @@ function revisarBusqueda(b) {
     const db = normalizar(b.deal_breakers), hs = separarLista(b.hard_skills).map(normalizar);
     hs.forEach(h => { if (h.length > 3 && db.includes(h)) avisos.push({ tipo: 'excluyente', campo: 'deal_breakers', texto: '"' + h + '" figura como excluyente y como habilidad del puesto. Si es la competencia central, conviene que se puntue (no que excluya): si no, el score termina ordenando a los candidatos por lo secundario.' }); });
   }
+  separarLista(b.deal_breakers, true).filter(esCompetenciaBlanda).forEach(x => avisos.push({ tipo: 'excluyente', campo: 'deal_breakers', texto: '"' + x + '" esta en Excluyentes pero es una competencia: APTIA la evalua como competencia central (suma o resta en escala) y no pone tope. Si queres que quede prolijo, pasala a Competencias clave.' }));
   return avisos;
 }
 
@@ -546,7 +638,7 @@ TAREAS:
 1. Lista ATOMICA de requisitos: separa los que traen varias cosas juntas ("Excel y Tokko" -> dos), une duplicados. NO inventes requisitos que no esten en los campos. Mantene los de "sistema".
 2. Para cada requisito: "criticidad" = CORE (es el corazon del puesto: sin esto no puede hacer el trabajo), IMPORTANTE, o COMPLEMENTARIO (suma pero no define). Usa CORE con moderacion (2 a 5). Si las notas del consultor dicen que algo es "plus" o "no primordial", es COMPLEMENTARIO.
 3. "ancla" concreta para ESTE puesto: que tiene que mostrar un CV para CUMPLE, que cuenta como PARCIAL (equivalencias razonables) y que es NO CUMPLE.
-4. Excluyentes reales: lista atomica de deal_breakers (solo lo que esta en ese campo) y como se verifica cada uno.
+4. Excluyentes reales: lista atomica de deal_breakers (solo lo que esta en ese campo) y como se verifica cada uno. Un excluyente es una CONDICION verificable con un dato (horario, sabados, zona, movilidad, titulo, matricula, idioma, años de experiencia). Si en deal_breakers hay COMPETENCIAS o actitudes (vocacion, paciencia, empatia, que le importen las personas, compromiso, actitud), NO van como excluyentes: ponelas en "requisitos" como softSkills CORE con origen "deal_breakers".
 5. "experienciaMinimaAnios": numero de años que pide experiencia_minima (null si no dice un numero). "experienciaRelevante": que experiencia cuenta como relevante (rol, tareas, rubro).
 6. "nivelSeniority" esperado: JUNIOR, SEMI SENIOR, SENIOR, JEFATURA o GERENCIA.
 7. "perfilDISC" que pide el puesto, factor por factor (nivel ALTO/MEDIO/BAJO e importancia CRITICO/IMPORTANTE/SECUNDARIO/INDIFERENTE). Si el campo perfil_disc esta cargado, respetalo; si no, inferilo de las tareas y competencias y explica por que.
@@ -573,7 +665,9 @@ Devolve SOLO este JSON:
     criticidad: PESO_CRITICIDAD[String(x.criticidad || '').toUpperCase()] ? String(x.criticidad).toUpperCase() : 'IMPORTANTE',
     plus: !!x.plus,
     ancla: x.ancla && typeof x.ancla === 'object' ? { cumple: String(x.ancla.cumple || ''), parcial: String(x.ancla.parcial || ''), noCumple: String(x.ancla.noCumple || '') } : null
-  })).filter(x => x.cat && x.texto && (x.origen === 'sistema' || (camposConDato.has(x.origen) && textoSaleDeCampo(x.texto, b[x.origen]))));
+  })).filter(x => x.cat && x.texto && (x.origen === 'sistema' || (camposConDato.has(x.origen) && textoSaleDeCampo(x.texto, b[x.origen]))))
+    .filter(x => x.origen !== 'deal_breakers' || esCompetenciaBlanda(x.texto))    // de Excluyentes solo pasan a requisito las competencias
+    .filter(x => !esRequisitoVacio(x.texto) && (x.origen === 'sistema' || !esValorVacio(b[x.origen])));   // "Indistinto" no es un requisito
   // los requisitos "de sistema" siempre con su texto canonico (el server los calcula o los busca por clave)
   const sistemaIA = reqs.filter(x => x.origen === 'sistema');
   reqs = reqs.filter(x => x.origen !== 'sistema');
@@ -585,13 +679,19 @@ Devolve SOLO este JSON:
   base.requisitos.filter(br => br.origen !== 'sistema').forEach(br => {
     if (!reqs.some(x => x.origen === br.origen)) reqs.push({ cat: br.cat, texto: br.texto, origen: br.origen, clave: br.clave, criticidad: br.criticidad, plus: br.plus, ancla: null });
   });
+  // v2.7.2: cada competencia que estaba en Excluyentes queda como requisito CORE (se puntua, no excluye)
+  base.requisitos.filter(br => br.origen === 'deal_breakers').forEach(br => {
+    const m = reqs.find(x => x.origen === 'deal_breakers' && textoSaleDeCampo(x.texto, br.texto));
+    if (m) m.criticidad = 'CORE';
+    else reqs.push({ cat: br.cat, texto: br.texto, origen: br.origen, clave: null, criticidad: 'CORE', plus: false, ancla: null });
+  });
   // experiencia minima: un solo requisito con clave (el sistema lo calcula con la linea de tiempo)
   const expMinReq = reqs.find(x => x.origen === 'experiencia_minima');
   if (expMinReq) expMinReq.clave = 'exp_min';
   reqs = reqs.slice(0, 40).map((x, i) => Object.assign({ id: 'R' + (i + 1), tipo: TIPO_CATEGORIA[x.cat], clave: null }, x));
 
   let excl = (Array.isArray(r.excluyentes) ? r.excluyentes : []).map(x => ({ texto: String(x.requisito || '').trim(), comoSeVerifica: String(x.comoSeVerifica || '') }))
-    .filter(x => x.texto && textoSaleDeCampo(x.texto, b.deal_breakers));
+    .filter(x => x.texto && textoSaleDeCampo(x.texto, b.deal_breakers) && !esCompetenciaBlanda(x.texto));
   if (!excl.length && base.excluyentes.length) excl = base.excluyentes.map(x => ({ texto: x.texto, comoSeVerifica: '' }));
   excl = excl.slice(0, 10).map((x, i) => Object.assign({ id: 'X' + (i + 1) }, x));
 
@@ -925,18 +1025,38 @@ function recomendacionPorScore(s, excluyenteIncumplido) {
   return 'NO AVANZAR';
 }
 
+// v2.8.1: lo que calcula el sistema vuelve al criterio riguroso original (v2.8.0 lo habia aflojado):
+// - seniority: solo "acorde" cumple; sobrecalificado o subcalificado es parcial.
+// - permanencia: rotacion baja = cumple, media = parcial, alta = no cumple.
+// Tambien deshace lo que v2.8.0 haya guardado en las lecturas.
+const PREFIJO_SOBRECALIF = 'Supera el nivel del puesto: cumple (conviene conversar la motivacion). ';
+function reglasSistemaLectura(items, info) {
+  const itSen = items.find(i => i.clave === 'seniority');
+  if (itSen) {
+    const mot = String(itSen.motivo || '');
+    const delSistema = mot.startsWith(PREFIJO_SOBRECALIF) || (info.nivelCandidato && mot.startsWith('Nivel ' + info.nivelCandidato));
+    if (delSistema && info.seniorityAjuste && info.seniorityAjuste !== 'ACORDE' && itSen.resultado === 'CUMPLE') itSen.resultado = 'PARCIAL';
+    if (mot.startsWith(PREFIJO_SOBRECALIF)) itSen.motivo = mot.substring(PREFIJO_SOBRECALIF.length);
+  }
+  const itEst = items.find(i => i.clave === 'estabilidad');
+  if (itEst && itEst.calculado && info.rotacion) itEst.resultado = info.rotacion === 'BAJA' ? 'CUMPLE' : info.rotacion === 'MEDIA' ? 'PARCIAL' : 'NO CUMPLE';
+  return items;
+}
+
 // Puntua items ya clasificados (se usa al analizar y al recalcular sin IA cuando cambian las criticidades)
 function puntuarItems(items, tipoPuesto) {
   const pesos = PESOS_TIPO_PUESTO[tipoPuesto] || PESOS_TIPO_PUESTO.general;
   items.forEach(it => {
-    let comoRes = it.resultado;
-    if (it.resultado === 'CUMPLE' && it.evidencia === 'AUTODECLARADO') comoRes = 'PARCIAL';
+    const comoRes = it.resultado === 'CUMPLE' && it.evidencia === 'AUTODECLARADO' ? 'PARCIAL' : it.resultado;
     it.puntosComo = comoRes;
     const vig = (it.resultado === 'CUMPLE' || it.resultado === 'PARCIAL') ? (FACTOR_VIGENCIA[it.vigencia] || 1) : 1;
-    it.valor = Math.round(PUNTOS_REQ[it.tipo][comoRes] * vig * 1000) / 1000;
+    it.valor = Math.round((PUNTOS_REQ[it.tipo] || PUNTOS_REQ.duro)[comoRes] * vig * 1000) / 1000;
+    if (!Number.isFinite(it.valor)) it.valor = 0;
     it.peso = PESO_CRITICIDAD[it.criticidad] || 2;
+    // "Indistinto" / "No importa" no es un requisito: no cuenta (busquedas cargadas antes de v2.8)
+    if (esRequisitoVacio(it.requisito)) it.ignorado = true; else delete it.ignorado;
     // un "plus" que no esta, no resta: queda fuera del promedio
-    it.cuenta = !(it.plus && (it.resultado === 'SIN DATOS' || it.resultado === 'NO CUMPLE'));
+    it.cuenta = !it.ignorado && !(it.plus && (it.resultado === 'SIN DATOS' || it.resultado === 'NO CUMPLE'));
   });
   const categorias = {};
   Object.keys(pesos).forEach(cat => {
@@ -958,7 +1078,7 @@ function puntuarItems(items, tipoPuesto) {
   const cuentan = items.filter(i => i.cuenta);
   const pesoTot = cuentan.reduce((s, i) => s + i.peso, 0) || 1;
   const cobertura = Math.round(cuentan.filter(i => i.resultado !== 'SIN DATOS').reduce((s, i) => s + i.peso, 0) / pesoTot * 100);
-  const coreSinDatos = items.filter(i => i.criticidad === 'CORE' && i.resultado === 'SIN DATOS').map(i => i.requisito);
+  const coreSinDatos = items.filter(i => i.cuenta && i.criticidad === 'CORE' && i.resultado === 'SIN DATOS').map(i => i.requisito);
   const confianza = cobertura >= 70 && !coreSinDatos.length ? 'ALTA' : cobertura >= 45 ? 'MEDIA' : 'BAJA';
   return { score: redondear(total), desglose, pesos, cobertura, confianza, coreSinDatos };
 }
@@ -1087,7 +1207,7 @@ function verificarYEnriquecer(r, perfil, cvNorm, cvParaIA) {
     if (!['CUMPLE', 'NO CUMPLE', 'SIN DATOS'].includes(res)) res = 'SIN DATOS';
     let verificada = null;
     if (res !== 'SIN DATOS') { verificada = citaVerificada(c.cita, textoNorm) && !RE_SENSIBLE_EN_TEXTO.test(String(c.cita || '')); if (!verificada) res = 'SIN DATOS'; }
-    return { id: x.id, requisito: x.texto, resultado: res, cita: c.cita || '', motivo: c.motivo || '', verificada };
+    return { id: x.id, requisito: x.texto, resultado: res, cita: c.cita || '', motivo: c.motivo || '', verificada, competencia: esCompetenciaBlanda(x.texto) || undefined };
   });
 
   // ── fortalezas con evidencia (las que no tienen cita en el CV se descartan) ──
@@ -1161,8 +1281,9 @@ async function analizarCVv4(cvOriginal, busqueda, opciones) {
     itSen.motivo = (sen.nivelCandidato ? 'Nivel ' + sen.nivelCandidato + (perfil.nivelSeniority ? ' para un puesto ' + perfil.nivelSeniority : '') + '. ' : '') + (sen.motivo || '');
   }
 
+  reglasSistemaLectura(v.items, { seniorityAjuste: senVerif ? ajusteSen : null, nivelCandidato: sen.nivelCandidato || null, rotacion: tl.rotacion });
   const calc = puntuarItems(v.items, tipo);
-  const incumplidos = v.exclRes.filter(x => x.resultado === 'NO CUMPLE');
+  const incumplidos = v.exclRes.filter(x => x.resultado === 'NO CUMPLE' && !esCompetenciaBlanda(x.requisito));   // una competencia no pone tope
   const sinDatos = v.exclRes.filter(x => x.resultado === 'SIN DATOS');
   const scoreCV = incumplidos.length ? Math.min(calc.score, TOPE_EXCLUYENTE) : calc.score;
 
@@ -1241,8 +1362,10 @@ function recalcularLectura(lectura, perfil, tipoPuesto) {
   (perfil.requisitos || []).forEach(p => { porTexto[normalizar(p.texto)] = p; });
   lectura.requisitos.forEach(it => { const p = porTexto[normalizar(it.requisito)] || (it.clave ? (perfil.requisitos || []).find(x => x.clave === it.clave) : null); if (p) { it.criticidad = p.criticidad; it.plus = p.plus; } });
   const tipo = PESOS_TIPO_PUESTO[tipoPuesto] ? tipoPuesto : 'general';
+  reglasSistemaLectura(lectura.requisitos, { seniorityAjuste: lectura.seniority && lectura.seniority.ajuste, nivelCandidato: lectura.seniority && lectura.seniority.nivelCandidato, rotacion: lectura.rotacion });
   const calc = puntuarItems(lectura.requisitos, tipo);
-  const incumplidos = (lectura.excluyentes || []).filter(x => x.resultado === 'NO CUMPLE');
+  (lectura.excluyentes || []).forEach(x => { if (esCompetenciaBlanda(x.requisito)) x.competencia = true; else delete x.competencia; });
+  const incumplidos = (lectura.excluyentes || []).filter(x => x.resultado === 'NO CUMPLE' && !x.competencia);
   const score = incumplidos.length ? Math.min(calc.score, TOPE_EXCLUYENTE) : calc.score;
   Object.assign(lectura, { tipoPuesto: tipo, pesos: calc.pesos, desglose: calc.desglose, scoreCalculado: calc.score, cobertura: calc.cobertura, confianza: calc.confianza, coreSinDatos: calc.coreSinDatos,
     topeExcluyente: incumplidos.length ? TOPE_EXCLUYENTE : null,
@@ -1374,10 +1497,11 @@ function recalcularPortfolio(pa, perfil) {
 // El numero de compatibilidad sale de esa comparacion con una tabla fija.
 // ───────────────────────────────────────
 const DISC_PESO_IMPORTANCIA = { 'CRITICO': 3, 'IMPORTANTE': 2, 'SECUNDARIO': 1, 'INDIFERENTE': 0 };
-const DISC_NOTA_AJUSTE = { 'ALINEADO': 100, 'DESVIO LEVE': 60, 'DESVIO FUERTE': 15 };
-const DISC_NOTA_COMPETENCIA = { 'FAVORECE': 100, 'NEUTRO': 60, 'DIFICULTA': 15 };
+// v2.7.2: el DISC muestra tendencias, no capacidades: un desvio resta mucho menos (antes 60 / 15)
+const DISC_NOTA_AJUSTE = { 'ALINEADO': 100, 'DESVIO LEVE': 75, 'DESVIO FUERTE': 40 };
+const DISC_NOTA_COMPETENCIA = { 'FAVORECE': 100, 'NEUTRO': 75, 'DIFICULTA': 40 };
 const DISC_PESO_FACTORES = 0.7, DISC_PESO_COMPETENCIAS = 0.3;
-const DISC_PENALIDAD_TENSION = { 'BAJA': 0, 'MEDIA': 5, 'ALTA': 10 }; // brecha natural vs adaptado (desgaste)
+const DISC_PENALIDAD_TENSION = { 'BAJA': 0, 'MEDIA': 2, 'ALTA': 5 }; // brecha natural vs adaptado (desgaste)
 
 function numerosEnTexto(t) {
   return new Set((String(t || '').match(/\d+(?:[.,]\d+)?/g) || []).map(x => Number(x.replace(',', '.'))));
@@ -1462,15 +1586,16 @@ function evaluarValidezDISC(v, factores, discTexto) {
   out.confiabilidad = conf;
   out.motivos = motivos;
   out.sinIndicadores = Object.keys(DISC_NIVELES_VALIDEZ).every(k => out[k].nivel === 'NO INFORMA');
-  out.efectoEnScore = conf === 'BAJA' ? 'El DISC no entra en el score final (resultado poco confiable).' : conf === 'MEDIA' ? 'El DISC entra con la mitad de su peso en el score final.' : 'Peso completo.';
+  out.efectoEnScore = 'Orientativo: el conductual no suma ni resta en el score.' + (conf === 'BAJA' ? ' Ademas el test parece poco confiable: tomalo con mucha cautela.' : conf === 'MEDIA' ? ' Tomalo con cautela.' : '');
   return out;
 }
 
+// v2.8: describe el estilo frente al que pide el puesto (es orientativo, no es una nota)
 function veredictoDISC(n) {
   if (n == null) return 'SIN DATOS SUFICIENTES';
-  if (n >= 70) return 'COMPATIBLE';
-  if (n >= 55) return 'COMPATIBLE CON OBSERVACIONES';
-  return 'BAJA COMPATIBILIDAD';
+  if (n >= 70) return 'ESTILO AFIN AL PUESTO';
+  if (n >= 55) return 'ESTILO PARCIALMENTE AFIN';
+  return 'ESTILO DISTINTO AL QUE PIDE EL PUESTO (a acompañar)';
 }
 
 // Nivel del candidato a partir del VALOR del test (no de la opinion de la IA), segun la escala del informe:
@@ -1606,31 +1731,39 @@ function procesarDISC(r, req, discTexto) {
 // v2.7: dependen del tipo de puesto. La entrevista estructurada es la herramienta que mejor predice el
 // desempeño, asi que pesa un poco mas que el CV; en puestos creativos el portfolio pesa fuerte.
 // Si en Railway se cargan PESO_TECNICO / PESO_ENTREVISTA / PESO_DISC / PESO_PORTFOLIO, mandan esos para todos.
+// v2.8: el conductual (DISC) NO entra al score. Describe tendencias, no capacidades: sirve para entender a la
+// persona, armar la entrevista y saber como acompañarla, no para sumar o restar (los propios autores del DISC
+// no lo recomiendan para decidir una contratacion). El "tecnico" ahora es el CV validado con la entrevista.
 const PESOS_FINAL_TIPO = {
-  general:        { tecnico: 35, entrevista: 40, disc: 15, portfolio: 10 },
-  comercial:      { tecnico: 30, entrevista: 45, disc: 15, portfolio: 10 },
-  tecnico:        { tecnico: 40, entrevista: 40, disc: 10, portfolio: 10 },
-  creativo:       { tecnico: 25, entrevista: 35, disc: 10, portfolio: 30 },
-  profesional:    { tecnico: 40, entrevista: 40, disc: 10, portfolio: 10 },
-  liderazgo:      { tecnico: 30, entrevista: 45, disc: 15, portfolio: 10 },
-  operativo:      { tecnico: 40, entrevista: 40, disc: 10, portfolio: 10 },
-  administrativo: { tecnico: 40, entrevista: 40, disc: 10, portfolio: 10 }
+  general:        { tecnico: 40, entrevista: 50, disc: 0, portfolio: 10 },
+  comercial:      { tecnico: 35, entrevista: 55, disc: 0, portfolio: 10 },
+  tecnico:        { tecnico: 50, entrevista: 40, disc: 0, portfolio: 10 },
+  creativo:       { tecnico: 30, entrevista: 40, disc: 0, portfolio: 30 },
+  profesional:    { tecnico: 45, entrevista: 45, disc: 0, portfolio: 10 },
+  liderazgo:      { tecnico: 35, entrevista: 55, disc: 0, portfolio: 10 },
+  operativo:      { tecnico: 45, entrevista: 45, disc: 0, portfolio: 10 },
+  administrativo: { tecnico: 45, entrevista: 45, disc: 0, portfolio: 10 }
 };
 const PESOS_ENV = ['PESO_TECNICO', 'PESO_ENTREVISTA', 'PESO_DISC', 'PESO_PORTFOLIO'].some(k => process.env[k]);
 function pesosFinales(tipo) {
-  if (PESOS_ENV) return { tecnico: Number(process.env.PESO_TECNICO || 35), entrevista: Number(process.env.PESO_ENTREVISTA || 40), disc: Number(process.env.PESO_DISC || 15), portfolio: Number(process.env.PESO_PORTFOLIO || 10) };
+  if (PESOS_ENV) return { tecnico: Number(process.env.PESO_TECNICO || 40), entrevista: Number(process.env.PESO_ENTREVISTA || 50), disc: Number(process.env.PESO_DISC || 0), portfolio: Number(process.env.PESO_PORTFOLIO || 10) };
   return PESOS_FINAL_TIPO[tipo] || PESOS_FINAL_TIPO.general;
 }
 
 // Tabla de puntos: cuanto mueve el score tecnico cada resultado verificado
-const PUNTOS_BRECHA    = { 'CERRADA': 4, 'REDUCIDA': 2, 'SIN CAMBIO': 0, 'AMPLIADA': -3, 'NO TRATADA': 0 };
+// v2.8: las brechas ya no suman ni restan puntos sueltos: lo que la entrevista muestra sobre un requisito cambia ESE
+// requisito (con su peso real). Y una red flag ya baja la nota de su pregunta a 0: no se castiga dos veces.
+const PUNTOS_BRECHA    = { 'CERRADA': 0, 'REDUCIDA': 0, 'SIN CAMBIO': 0, 'AMPLIADA': 0, 'NO TRATADA': 0 };
 const PUNTOS_FORTALEZA = { 'CONFIRMADA': 1, 'SIN EVIDENCIA': 0, 'CONTRADICHA': -4, 'NO TRATADA': 0 };
-const PUNTOS_RED_FLAG  = -3;      // cada red flag verificada en una pregunta
+const PUNTOS_RED_FLAG  = 0;
 const TOPE_AJUSTE      = 15;      // el ajuste tecnico total queda entre -15 y +15
 const AJUSTE_CONSULTOR_MAX = 5;   // impresion humana de Hernan sobre el score final: -5 a +5
 
 // Nota de cada pregunta efectivamente hecha (el score de entrevista es el promedio)
-const NOTA_PREGUNTA = { 'CONFIRMA': 100, 'PARCIAL': 60, 'NO SOSTIENE': 20, 'RED FLAG': 0 };
+// v2.7.2: PARCIAL y NO SOSTIENE restan menos (antes 60 y 20): una respuesta incompleta no es una mala respuesta
+const NOTA_PREGUNTA = { 'CONFIRMA': 100, 'PARCIAL': 70, 'NO SOSTIENE': 30, 'RED FLAG': 0 };
+// Competencias centrales (las que estaban cargadas como excluyentes): se puntuan en escala, entran al promedio de la entrevista
+const NOTA_COMPETENCIA_ENT = { 'DEMOSTRADA': 100, 'PARCIAL': 70, 'NO DEMOSTRADA': 30 };
 
 function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
 // Redondeo "humano": 77,5 → 78 aunque la cuenta en coma flotante de 77,49999999 (sin esto, 0,7 × 3 + 1 daba 77)
@@ -1717,13 +1850,58 @@ const PUNTOS_CONTRADICCION = -3;
 const PUNTOS_REF_CONTRADICE = -4, PUNTOS_REF_CONFIRMA = 1, TOPE_REF_CONFIRMA = 3;
 
 // Recibe la clasificacion de la IA y devuelve todo verificado + calculado
-function evaluarEntrevista(clasif, transcripcion, cvTexto, referenciasTexto) {
+// ───────── v2.8: tolerancia a la transcripcion automatica ─────────
+// La entrevista se graba y se pasa a texto con un programa: los nombres propios salen deformados ("AZCUY" → "Hascouet").
+// Si una "contradiccion" es en realidad el mismo nombre mal transcripto, se descarta sola.
+function claveFonetica(w) {
+  return normalizar(w).replace(/[^a-z]/g, '')
+    .replace(/ph/g, 'f').replace(/sh/g, 's').replace(/ch/g, '1').replace(/ll/g, 'y').replace(/qu/g, 'k').replace(/gu(?=[ei])/g, 'g')
+    .replace(/ou/g, 'u').replace(/w/g, 'u').replace(/v/g, 'b').replace(/z/g, 's').replace(/c(?=[ei])/g, 's').replace(/c/g, 'k')
+    .replace(/x/g, 'ks').replace(/g(?=[ei])/g, 'j').replace(/h/g, '').replace(/y$/, 'i').replace(/(.)\1+/g, '$1');
+}
+function distanciaEdicion(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i].concat(new Array(b.length).fill(0)));
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+function suenanParecido(a, b) {
+  const A = claveFonetica(a), B = claveFonetica(b);
+  if (A.length < 3 || B.length < 3 || A[0] !== B[0]) return false;
+  // misma familia de palabras ("coordinadora" / "coordinaba") no es un nombre mal transcripto
+  const na = normalizar(a), nb = normalizar(b);
+  let pref = 0; while (pref < na.length && na[pref] === nb[pref]) pref++;
+  if (pref >= 5) return false;
+  return 1 - distanciaEdicion(A, B) / Math.max(A.length, B.length) >= 0.6;
+}
+const RE_TEMA_NOMBRE = /empresa|compa[nñ]i|emplead|nombre|lugar|instituci|universidad|facultad|colegio|escuela|marca|sistema|herramienta|software|plataforma|crm|cliente|inmobiliaria|agencia|estudio|banco|ciudad|localidad|barrio|organizaci|consultora/i;
+function posibleErrorTranscripcion(c, cvN, tN) {
+  if (!RE_TEMA_NOMBRE.test(String(c.tema || '') + ' ' + String(c.motivo || ''))) return null;
+  // palabras con mayuscula (nombres propios) y pares seguidos unidos ("Brodi Fridman" ~ "BrodyFriedman")
+  const nombres = t => {
+    const ws = String(t || '').match(/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+/g) || [];
+    const out = [];
+    ws.forEach((w, i) => {
+      if (!/^[A-ZÁÉÍÓÚÜÑ]/.test(w)) return;
+      if (w.length >= 3) out.push(w);
+      if (ws[i + 1] && /^[A-ZÁÉÍÓÚÜÑ]/.test(ws[i + 1])) out.push(w + ws[i + 1]);
+    });
+    return out;
+  };
+  const enTexto = (w, n) => (' ' + n + ' ').includes(' ' + normalizar(w) + ' ');
+  const delCV = nombres(c.citaCV).filter(w => !enTexto(w, tN));
+  const deEnt = nombres(c.citaEntrevista).filter(w => !enTexto(w, cvN));
+  for (const a of delCV) for (const b of deEnt) if (suenanParecido(a, b)) return [a, b];
+  return null;
+}
+
+function evaluarEntrevista(clasif, transcripcion, cvTexto, referenciasTexto, lectura) {
   const sep = separarHablantes(transcripcion);
   // si se pudo separar, las citas se buscan SOLO en lo que dijo el candidato
   const tn = normalizar(sep ? sep.candidato : transcripcion);
   const tnEntrev = sep ? normalizar(sep.entrevistadorTexto) : '';
   const motivoAnulada = cita => (sep && citaVerificada(cita, tnEntrev)) ? 'La frase la dijo el entrevistador, no el candidato: no cuenta.' : 'La cita no esta en la transcripcion: no cuenta.';
-  const detalle = { preguntas: [], brechas: [], fortalezas: [], contradicciones: [], excluyentes: [], referencias: [], citasAnuladas: 0,
+  const detalle = { preguntas: [], brechas: [], fortalezas: [], competencias: [], requisitos: [], contradicciones: [], excluyentes: [], referencias: [], citasAnuladas: 0,
     hablantes: sep ? { entrevistador: sep.entrevistador, otros: sep.hablantes.filter(h => h !== sep.entrevistador) } : null };
   let ajuste = 0;
 
@@ -1761,14 +1939,43 @@ function evaluarEntrevista(clasif, transcripcion, cvTexto, referenciasTexto) {
 
   // Contradicciones CV vs entrevista: solo cuentan si las DOS citas existen
   const cvN = normalizar(cvTexto || '');
+  // v2.8: "CONTRADICCION" (el candidato dice algo de fondo distinto al CV: cargo, tareas, fechas) resta; "A ACLARAR" no resta;
+  // un nombre que suena parecido es un error de transcripcion y se descarta solo.
   (clasif.contradicciones || []).forEach(c => {
     const okCV = citaVerificada(c.citaCV, cvN);
     const okEnt = citaVerificada(c.citaEntrevista, tn);
     const verificada = okCV && okEnt;
     if (!verificada) detalle.citasAnuladas++;
-    const pts = verificada ? PUNTOS_CONTRADICCION : 0;
-    ajuste += pts;
-    detalle.contradicciones.push({ tema: c.tema || '', citaCV: c.citaCV || '', citaEntrevista: c.citaEntrevista || '', motivo: verificada ? (c.motivo || '') : (!okCV ? 'La frase del CV no esta en el CV: no cuenta.' : motivoAnulada(c.citaEntrevista)), verificada, puntosTecnico: pts });
+    let res = String(c.resultado || c.gravedad || '').toUpperCase().trim();
+    res = /ACLARAR|MENOR/.test(res) ? 'A ACLARAR' : 'CONTRADICCION';
+    let motivo = verificada ? (c.motivo || '') : (!okCV ? 'La frase del CV no esta en el CV: no cuenta.' : motivoAnulada(c.citaEntrevista));
+    const err = verificada ? posibleErrorTranscripcion(c, cvN, tn) : null;
+    if (err) { res = 'DESCARTADA'; motivo = 'Probable error de la transcripcion automatica: "' + err[0] + '" (CV) y "' + err[1] + '" (entrevista) suenan parecido. Si de verdad es otra cosa, cambialo.'; }
+    detalle.contradicciones.push({ tema: c.tema || '', resultado: res, citaCV: c.citaCV || '', citaEntrevista: c.citaEntrevista || '', motivo, verificada, puntosTecnico: 0 });
+  });
+
+  // v2.8: requisitos del puesto vistos en la entrevista. Lo que el CV no mostraba y la entrevista si, cuenta (y al reves).
+  const reqsCV = lectura && Array.isArray(lectura.requisitos) ? lectura.requisitos : [];
+  (clasif.requisitos || []).forEach(x => {
+    const id = String(x.id || '').toUpperCase().trim();
+    const def = reqsCV.find(r => String(r.id).toUpperCase() === id);
+    if (!def || detalle.requisitos.some(r => r.id === id)) return;
+    let res = String(x.resultado || '').toUpperCase().trim();
+    if (!['CUMPLE', 'PARCIAL', 'NO CUMPLE'].includes(res)) res = 'SIN CAMBIO';
+    const verificada = res === 'SIN CAMBIO' ? null : citaVerificada(x.cita, tn);
+    if (verificada === false) detalle.citasAnuladas++;
+    detalle.requisitos.push({ id, requisito: def.requisito, criticidad: def.criticidad,
+      resultadoCV: def.resultado === 'CUMPLE' && def.evidencia === 'AUTODECLARADO' ? 'DECLARADO' : def.resultado,
+      resultado: res, cita: x.cita || '', motivo: verificada === false ? motivoAnulada(x.cita) : (x.motivo || ''), verificada });
+  });
+
+  // Competencias centrales del puesto (v2.7.2)
+  (clasif.competencias || []).forEach(x => {
+    let res = String(x.resultado || '').toUpperCase().trim();
+    if (!(res in NOTA_COMPETENCIA_ENT)) res = 'NO TRATADA';
+    const verificada = res === 'NO TRATADA' ? null : citaVerificada(x.cita, tn);
+    if (verificada === false) detalle.citasAnuladas++;
+    detalle.competencias.push({ competencia: x.competencia || '', resultado: res, cita: x.cita || '', motivo: verificada === false ? motivoAnulada(x.cita) : (x.motivo || ''), verificada });
   });
 
   // Excluyentes validados en la entrevista
@@ -1797,38 +2004,129 @@ function evaluarEntrevista(clasif, transcripcion, cvTexto, referenciasTexto) {
       motivo: verificada ? '' : 'La cita no esta en las notas de referencias: no cuenta.', verificada, puntosTecnico: pts });
   });
 
-  const notas = detalle.preguntas.filter(p => p.cuenta).map(p => p.nota);
-  const score = notas.length ? redondear(notas.reduce((a, b) => a + b, 0) / notas.length) : null;
-  const ajusteBruto = ajuste;
-  ajuste = clamp(ajuste, -TOPE_AJUSTE, TOPE_AJUSTE);
-
-  return {
-    score,                                   // null si ninguna pregunta quedo verificada
-    ajusteTecnico: ajuste,
-    ajusteBruto,
-    preguntasHechas: notas.length,
-    preguntasTotales: detalle.preguntas.length,
+  // los numeros salen de la misma cuenta que usa la correccion del consultor (recalcularEvalEnt)
+  return recalcularEvalEnt({
     detalle,
     nota: !String(transcripcion || '').trim() ? 'Sin entrevista cargada.' : sep ? 'Se separo lo que dijo cada uno: las citas se buscan solo en lo que dijo ' + detalle.hablantes.otros.join(', ') + '.' : 'La transcripcion no separa quien habla: las citas se buscan en todo el texto. Si la pegas con nombres ("Hernan: ...", "Candidato: ..."), el control es mas fino.'
-  };
+  });
+}
+
+// ───────── v2.7.2: CORRECCION DEL CONSULTOR + recalculo de la entrevista ─────────
+// El consultor estuvo en la entrevista: si la IA clasifico mal una pregunta, brecha, fortaleza, competencia o
+// excluyente, lo cambia con un clic. La correccion se guarda aparte (correcciones_entrevista) y se vuelve a aplicar
+// cada vez que se regenera el informe. Los numeros se recalculan siempre desde el detalle con las tablas fijas.
+const CORRECCION_TIPOS = {
+  pregunta:    { lista: 'preguntas',    campo: 'pregunta',    valores: ['CONFIRMA', 'PARCIAL', 'NO SOSTIENE', 'RED FLAG', 'NO PREGUNTADA'] },
+  brecha:      { lista: 'brechas',      campo: 'brecha',      valores: ['CERRADA', 'REDUCIDA', 'SIN CAMBIO', 'AMPLIADA', 'NO TRATADA'] },
+  fortaleza:   { lista: 'fortalezas',   campo: 'fortaleza',   valores: ['CONFIRMADA', 'SIN EVIDENCIA', 'CONTRADICHA', 'NO TRATADA'] },
+  competencia: { lista: 'competencias', campo: 'competencia', valores: ['DEMOSTRADA', 'PARCIAL', 'NO DEMOSTRADA', 'NO TRATADA'] },
+  excluyente:  { lista: 'excluyentes',  campo: 'requisito',   valores: ['CUMPLE', 'NO CUMPLE', 'NO TRATADO'] },
+  requisito:   { lista: 'requisitos',   campo: 'requisito',   valores: ['CUMPLE', 'PARCIAL', 'NO CUMPLE', 'SIN CAMBIO'] },
+  contradiccion: { lista: 'contradicciones', campo: 'tema',   valores: ['CONTRADICCION', 'A ACLARAR', 'DESCARTADA'] }
+};
+function claveCorreccion(tipo, texto) { return tipo + '|' + normalizar(texto).substring(0, 150); }
+
+function recalcularEvalEnt(ev, correcciones) {
+  if (!ev || !ev.detalle) return ev;
+  const d = ev.detalle;
+  if (!Array.isArray(d.competencias)) d.competencias = [];
+  const corr = correcciones && typeof correcciones === 'object' ? correcciones : {};
+  // 1) correcciones del consultor (o volver a lo que dijo la IA si la saco)
+  Object.keys(CORRECCION_TIPOS).forEach(tipo => {
+    const T = CORRECCION_TIPOS[tipo];
+    (d[T.lista] || []).forEach(it => {
+      const v = corr[claveCorreccion(tipo, it[T.campo])];
+      if (v && T.valores.includes(v)) {
+        if (!it.corregido) it.resultadoIA = it.resultado;
+        it.resultado = v; it.corregido = true;
+      } else if (it.corregido) {
+        it.resultado = it.resultadoIA; delete it.resultadoIA; delete it.corregido;
+      }
+    });
+  });
+  // 2) puntos y notas con las tablas vigentes. Lo que corrigio el consultor cuenta aunque la IA no haya encontrado la cita.
+  const vale = it => it.corregido || it.verificada === true;
+  d.preguntas.forEach(p => {
+    p.cuenta = p.resultado in NOTA_PREGUNTA && vale(p);
+    p.nota = p.cuenta ? NOTA_PREGUNTA[p.resultado] : null;
+    p.puntosTecnico = p.cuenta && p.resultado === 'RED FLAG' ? PUNTOS_RED_FLAG : 0;
+  });
+  d.brechas.forEach(b => { b.puntosTecnico = vale(b) ? (PUNTOS_BRECHA[b.resultado] || 0) : 0; });
+  d.fortalezas.forEach(f => { f.puntosTecnico = vale(f) ? (PUNTOS_FORTALEZA[f.resultado] || 0) : 0; });
+  d.competencias.forEach(c => {
+    c.cuenta = c.resultado in NOTA_COMPETENCIA_ENT && vale(c);
+    c.nota = c.cuenta ? NOTA_COMPETENCIA_ENT[c.resultado] : null;
+  });
+  if (!Array.isArray(d.requisitos)) d.requisitos = [];
+  d.requisitos.forEach(r => { r.cuenta = ['CUMPLE', 'PARCIAL', 'NO CUMPLE'].includes(r.resultado) && vale(r); });
+  (d.contradicciones || []).forEach(c => {
+    if (!c.resultado) c.resultado = 'CONTRADICCION';   // informes anteriores a v2.8
+    c.puntosTecnico = c.resultado === 'CONTRADICCION' && vale(c) ? PUNTOS_CONTRADICCION : 0;
+  });
+  // una competencia que quedo como excluyente (busquedas viejas) se marca: no pone tope
+  (d.excluyentes || []).forEach(x => { if (esCompetenciaBlanda(x.requisito)) x.competencia = true; else delete x.competencia; });
+  // 3) totales
+  const notasP = d.preguntas.filter(p => p.cuenta).map(p => p.nota);
+  const notasC = d.competencias.filter(c => c.cuenta).map(c => c.nota);
+  const notas = notasP.concat(notasC);
+  ev.score = notas.length ? redondear(notas.reduce((a, b) => a + b, 0) / notas.length) : null;   // null si nada quedo verificado
+  const bruto = ['preguntas', 'brechas', 'fortalezas', 'contradicciones', 'referencias'].reduce((s, k) => s + (d[k] || []).reduce((t, it) => t + (num(it.puntosTecnico) || 0), 0), 0);
+  ev.ajusteBruto = bruto;
+  ev.ajusteTecnico = clamp(bruto, -TOPE_AJUSTE, TOPE_AJUSTE);
+  ev.preguntasHechas = notasP.length;
+  ev.preguntasTotales = d.preguntas.length;
+  ev.competenciasEvaluadas = notasC.length;
+  ev.requisitosValidados = d.requisitos.filter(r => r.cuenta).length;
+  ev.correcciones = Object.keys(CORRECCION_TIPOS).reduce((s, tipo) => s + (d[CORRECCION_TIPOS[tipo].lista] || []).filter(it => it.corregido).length, 0);
+  return ev;
+}
+
+// v2.8: el perfil tecnico se arma con el CV + lo que mostro la entrevista. Un selector no deja un requisito en
+// "no surge del CV" si en la entrevista la persona conto que lo hace: se toma lo mejor de las dos fuentes
+// (y un "no lo hice" dicho en la entrevista baja ese requisito). Sin IA: se recalcula con las tablas fijas.
+function tecnicoConEntrevista(candidato, evalEnt, tipoPuesto) {
+  const lect = candidato.cv_lectura ? safeParse(candidato.cv_lectura) : null;
+  if (!lect || typeof lect !== 'object' || lect.version !== 'v4' || !Array.isArray(lect.requisitos) || !lect.requisitos.length) return null;
+  const items = lect.requisitos.map(it => Object.assign({}, it, { fuente: 'CV' }));
+  const vistos = evalEnt && evalEnt.detalle && Array.isArray(evalEnt.detalle.requisitos) ? evalEnt.detalle.requisitos.filter(r => r.cuenta) : [];
+  const nivel = it => it.resultado === 'CUMPLE' ? (it.evidencia === 'AUTODECLARADO' ? 1.5 : 2) : it.resultado === 'PARCIAL' ? 1 : 0;
+  let cambios = 0;
+  vistos.forEach(v => {
+    const it = items.find(i => String(i.id).toUpperCase() === v.id) || items.find(i => normalizar(i.requisito) === normalizar(v.requisito));
+    if (!it || it.ignorado) return;
+    const nuevo = { resultado: v.resultado, evidencia: 'HECHO' };
+    if (v.resultado !== 'NO CUMPLE' && nivel(nuevo) <= nivel(it)) return;   // la entrevista no agrega nada a lo que ya mostraba el CV
+    if (v.resultado === 'NO CUMPLE' && it.resultado === 'NO CUMPLE') return;
+    Object.assign(it, { resultado: v.resultado, evidencia: 'HECHO', vigencia: 'NO APLICA', fuente: 'ENTREVISTA', citaEntrevista: v.cita, resultadoCV: v.resultadoCV });
+    cambios++;
+  });
+  const tipo = PESOS_TIPO_PUESTO[tipoPuesto] ? tipoPuesto : (PESOS_TIPO_PUESTO[lect.tipoPuesto] ? lect.tipoPuesto : 'general');
+  const calc = puntuarItems(items, tipo);
+  return { score: calc.score, cambios, items };
 }
 
 function calcularScoreFinal(candidato, evalEnt, busqueda) {
   if (!busqueda && candidato.busqueda_id) { try { busqueda = db.prepare('SELECT tipo_puesto FROM busquedas WHERE id = ?').get(candidato.busqueda_id); } catch (e) {} }
   const PESOS_FINAL = pesosFinales(busqueda && busqueda.tipo_puesto);
   const tecnicoCV = num(candidato.score);
+  const tv = tecnicoConEntrevista(candidato, evalEnt, busqueda && busqueda.tipo_puesto);
+  const tecnicoBase = tv ? tv.score : tecnicoCV;
   const ajuste = evalEnt ? evalEnt.ajusteTecnico : 0;
   const componentes = [];
-  if (tecnicoCV != null) componentes.push({
-    clave: 'tecnico', nombre: 'Técnico (CV ' + tecnicoCV + (ajuste ? (ajuste > 0 ? ' +' : ' ') + ajuste + ' por entrevista' : '') + ')',
-    valor: clamp(tecnicoCV + ajuste, 0, 100)
+  if (tecnicoBase != null) componentes.push({
+    clave: 'tecnico',
+    nombre: 'Técnico (' + (tv && tv.cambios ? 'CV + entrevista: ' + tv.cambios + ' requisito' + (tv.cambios > 1 ? 's' : '') + ' validado' + (tv.cambios > 1 ? 's' : '') + ', ' + tecnicoBase : 'CV ' + tecnicoBase) +
+      (ajuste ? (ajuste > 0 ? ' +' : ' ') + ajuste + (evalEnt && evalEnt.detalle && evalEnt.detalle.referencias && evalEnt.detalle.referencias.length ? ' por entrevista y referencias' : ' por entrevista') : '') + ')',
+    valor: clamp(tecnicoBase + ajuste, 0, 100)
   });
-  if (evalEnt && evalEnt.score != null) componentes.push({ clave: 'entrevista', nombre: 'Entrevista (' + evalEnt.preguntasHechas + '/' + evalEnt.preguntasTotales + ' preguntas)', valor: evalEnt.score });
+  if (evalEnt && evalEnt.score != null) componentes.push({ clave: 'entrevista', nombre: 'Entrevista (' + evalEnt.preguntasHechas + '/' + evalEnt.preguntasTotales + ' preguntas' + (evalEnt.competenciasEvaluadas ? ' y ' + evalEnt.competenciasEvaluadas + ' competencia' + (evalEnt.competenciasEvaluadas > 1 ? 's' : '') : '') + ')', valor: evalEnt.score });
   const discObj = candidato.disc_resultado ? safeParse(candidato.disc_resultado) : null;
   const confDISC = discObj && discObj.validez ? discObj.validez.confiabilidad : 'ALTA';
   let factorDISC = 1;
   const notas = [];
-  if (num(candidato.disc_compatibilidad) != null) {
+  if (num(candidato.disc_compatibilidad) != null && !(PESOS_FINAL.disc > 0)) {
+    notas.push('Conductual (DISC): orientativo, no suma ni resta');
+  } else if (num(candidato.disc_compatibilidad) != null) {
     if (confDISC === 'BAJA') { factorDISC = 0; notas.push('DISC excluido: test poco confiable (' + (discObj.validez.motivos || []).join(', ') + ')'); }
     else {
       if (confDISC === 'MEDIA') { factorDISC = 0.5; notas.push('DISC con medio peso: ' + (discObj.validez.motivos || []).join(', ')); }
@@ -1852,8 +2150,9 @@ function calcularScoreFinal(candidato, evalEnt, busqueda) {
   const tramoCons = ajCons ? '  →  ' + base + (ajCons > 0 ? ' +' : ' ') + ajCons + ' (impresion del consultor' + (candidato.ajuste_consultor_motivo ? ': ' + candidato.ajuste_consultor_motivo : '') + ')' : '';
   // Excluyentes: un incumplido (en el CV o en la entrevista) pone tope; la entrevista puede levantar uno del CV si demuestra que si cumple
   const lect = candidato.cv_lectura ? safeParse(candidato.cv_lectura) : null;
-  const exclCV = lect && Array.isArray(lect.excluyentes) ? lect.excluyentes : [];
-  const exclEnt = evalEnt && evalEnt.detalle && Array.isArray(evalEnt.detalle.excluyentes) ? evalEnt.detalle.excluyentes : [];
+  // v2.7.2: una competencia cargada como excluyente ("vocacion", "paciencia") nunca pone tope: se puntua como competencia
+  const exclCV = (lect && Array.isArray(lect.excluyentes) ? lect.excluyentes : []).filter(x => !esCompetenciaBlanda(x.requisito));
+  const exclEnt = (evalEnt && evalEnt.detalle && Array.isArray(evalEnt.detalle.excluyentes) ? evalEnt.detalle.excluyentes : []).filter(x => !esCompetenciaBlanda(x.requisito));
   // mismo excluyente aunque este redactado un poco distinto (palabras significativas en comun)
   const mismoReq = (a, b) => { const A = palabrasSig(a), B = palabrasSig(b); if (!A.length || !B.length) return normalizar(a) === normalizar(b); return A.filter(w => B.includes(w)).length / Math.min(A.length, B.length) >= 0.6; };
   const incumplidos = [];
@@ -1867,7 +2166,8 @@ function calcularScoreFinal(candidato, evalEnt, busqueda) {
   return {
     scoreFinal,
     desglose: {
-      tecnicoCV, ajusteTecnico: ajuste, scoreCalculado: base,
+      tecnicoCV, tecnicoValidado: tv ? tv.score : null, requisitosValidados: tv ? tv.cambios : 0, ajusteTecnico: ajuste, scoreCalculado: base,
+      requisitos: tv ? tv.items.filter(i => !i.ignorado).map(i => ({ id: i.id, requisito: i.requisito, criticidad: i.criticidad, tipo: i.tipo, plus: !!i.plus, resultado: i.resultado, evidencia: i.evidencia, fuente: i.fuente, resultadoCV: i.resultadoCV || null })) : null,
       ajusteConsultor: ajCons, ajusteConsultorMotivo: candidato.ajuste_consultor_motivo || null,
       excluyentesIncumplidos: incumplidos, notas,
       componentes: componentes.map(c => ({ nombre: c.nombre, valor: c.valor, peso: c.peso, aporte: c.aporte })),
@@ -1947,21 +2247,24 @@ const NOMBRE_FACTOR = { D: 'orientacion a resultados', I: 'sociabilidad y persua
 function nivelTxt(n) { n = n.toLowerCase(); return n.startsWith('alt') ? 'alto' : n.startsWith('baj') ? 'bajo' : n.startsWith('dom') ? 'predominante' : 'medio'; }
 function traducirSiglas(t) {
   if (typeof t !== 'string') return t;
+  // v2.8.2: solo siglas en MAYUSCULA. Antes tambien tomaba minusculas y "s/d" (sin datos) o "c/u" se convertian en
+  // "combinacion de constancia y estabilidad con orientacion a resultados".
   const combo = '([DISC])\\s*[\\/-]\\s*([DISC])(?:\\s*[\\/-]\\s*([DISC]))?';
   return t
     // "perfil C/I" / "C/I" -> "perfil que combina analisis y precision con sociabilidad y persuasion"
-    .replace(new RegExp('\\b(?:(perfil|estilo)\\s+)?' + combo + '\\b', 'gi'), (m, w, a, b, c) => {
-      const ns = [a, b, c].filter(Boolean).map(x => NOMBRE_FACTOR[x.toUpperCase()]);
+    .replace(new RegExp('\\b(?:([Pp]erfil|[Ee]stilo)\\s+)?' + combo + '\\b', 'g'), (m, w, a, b, c) => {
+      if (!w && !c && a === 'S' && b === 'D') return m;   // "S/D" = sin datos
+      const ns = [a, b, c].filter(Boolean).map(x => NOMBRE_FACTOR[x]);
       return (w ? w + ' que combina ' : 'combinacion de ') + ns.slice(0, -1).join(', ') + ' con ' + ns[ns.length - 1];
     })
     // "perfil D alto", "factor S bajo" -> "nivel bajo de constancia y estabilidad"
-    .replace(/\b(?:perfil|factor|estilo)\s+([DISC])\s+(alt[oa]s?|baj[oa]s?|medi[oa]s?|dominante)\b/gi, (m, x, n) => 'nivel ' + nivelTxt(n) + ' de ' + NOMBRE_FACTOR[x.toUpperCase()])
+    .replace(/\b(?:[Pp]erfil|[Ff]actor|[Ee]stilo)\s+([DISC])\s+([Aa]lt[oa]s?|[Bb]aj[oa]s?|[Mm]edi[oa]s?|[Dd]ominante)\b/g, (m, x, n) => 'nivel ' + nivelTxt(n) + ' de ' + NOMBRE_FACTOR[x])
     // "perfil D" -> "perfil con predominio de orientacion a resultados"
-    .replace(/\b(perfil|estilo)\s+([DISC])\b/gi, (m, w, x) => w + ' con predominio de ' + NOMBRE_FACTOR[x.toUpperCase()])
-    .replace(/\bfactor\s+([DISC])\b/gi, (m, x) => NOMBRE_FACTOR[x.toUpperCase()])
+    .replace(/\b([Pp]erfil|[Ee]stilo)\s+([DISC])\b/g, (m, w, x) => w + ' con predominio de ' + NOMBRE_FACTOR[x])
+    .replace(/\b[Ff]actor\s+([DISC])\b/g, (m, x) => NOMBRE_FACTOR[x])
     // "D alto" -> "nivel alto de orientacion a resultados"
     .replace(/\b([DISC])\s+(alt[oa]s?|baj[oa]s?|medi[oa]s?|dominante)\b/g, (m, x, n) => 'nivel ' + nivelTxt(n) + ' de ' + NOMBRE_FACTOR[x])
-    .replace(/\b(el|del)\s+DISC\b/g, (m, w) => (w === 'del' ? 'de la' : 'la') + ' evaluacion conductual')
+    .replace(/\b(el|El|del|Del|un|Un|este|Este|ese|Ese)\s+DISC\b/g, (m, w) => ({ el: 'la', El: 'La', del: 'de la', Del: 'De la', un: 'una', Un: 'Una', este: 'esta', Este: 'Esta', ese: 'esa', Ese: 'Esa' }[w]) + ' evaluacion conductual')
     .replace(/\bDISC\b/g, 'evaluacion conductual')
     .replace(/^[a-z]/, ch => (/^[A-Z]/.test(t) ? ch.toUpperCase() : ch));
 }
@@ -1975,7 +2278,10 @@ function traducirDISCParaCliente(inf) {
 // del veredicto calculado (ej: "recomendamos avanzar" con un excluyente incumplido), se reescribe.
 function coherenciaCierre(inf, cand) {
   const t = String(inf.cierreConsultor || '');
-  const positivo = /\b(recomendamos|sugerimos|aconsejamos)\s+(avanzar|continuar|contratar|incorporar|su incorporacion|seguir)/i.test(t) && !/\bno\s+(recomendamos|sugerimos|aconsejamos)/i.test(t);
+  // v2.7.2: tambien "nuestra recomendacion es avanzar", "avanzar con cautela", "se recomienda avanzar"
+  const positivo = (/\b(recomendamos|sugerimos|aconsejamos)\s+(avanzar|continuar|contratar|incorporar|su incorporaci[oó]n|seguir)/i.test(t) ||
+    /recomendaci[oó]n\s+es\s+(avanzar|continuar|contratar|incorporar|seguir)|\bavanzar\s+con\s+(cautela|reservas|precauci[oó]n|condiciones)|\bse\s+recomienda\s+(avanzar|continuar|contratar|incorporar)|\bes\s+recomendable\s+(avanzar|continuar|contratar|incorporar)/i.test(t)) &&
+    !/\bno\s+(recomendamos|sugerimos|aconsejamos|se recomienda|es recomendable)/i.test(t);
   const negativo = /\bno\s+(recomendamos|sugerimos|aconsejamos)|\bno recomendad[oa]\b|\bno avanzar\b/i.test(t);
   const nombre = cand.nombre || 'el candidato';
   const excl = (inf.desglose && inf.desglose.excluyentesIncumplidos || []).map(x => x.replace(/\s*\(segun (el CV|la entrevista)\)$/, ''));
@@ -1986,133 +2292,340 @@ function coherenciaCierre(inf, cand) {
   } else if (inf.veredictoFinal === 'RECOMENDADO' && negativo && !positivo) {
     inf.cierreConsultor = 'Con la informacion relevada (CV, evaluacion conductual y entrevista), APTIA recomienda avanzar con ' + nombre + ' para este puesto.';
     inf.cierreReescrito = true;
+  } else if (inf.veredictoFinal === 'RECOMENDADO CON OBSERVACIONES' && negativo && !positivo) {
+    inf.cierreConsultor = 'Con la informacion relevada (CV, evaluacion conductual y entrevista), APTIA recomienda avanzar con ' + nombre + ' con observaciones: conviene validar los puntos señalados en este informe antes de decidir.';
+    inf.cierreReescrito = true;
   }
   return inf;
 }
 
-async function generarInformeFinal(candidato, busqueda) {
-  const disc = candidato.disc_resultado ? safeParse(candidato.disc_resultado) : null;
-  const portfolio = candidato.portfolio_analisis ? safeParse(candidato.portfolio_analisis) : null;
+// ───────── INFORME FINAL v2.8: dos pasos, como trabaja un selector ─────────
+// 1) CLASIFICAR la evidencia de la entrevista y las referencias (con citas verificadas). El sistema calcula el
+//    score y el veredicto con tablas fijas.
+// 2) REDACTAR el informe ya sabiendo el resultado: proporcionado, justo, primero lo que la persona aporta, y sin
+//    tareas internas en el texto del cliente (eso va en "pendientes del consultor").
+// Antes se escribia todo junto y ANTES de saber el resultado: salian informes de 72% "recomendado" con mas puntos
+// en contra que a favor, el DISC usado como defecto y frases como "antes de presentarla, conviene confirmar".
+function contextoInforme(candidato, busqueda) {
+  busqueda = busqueda || {};
   const transcripcion = String(candidato.notas_entrevista || '').trim();
-  const hayEntrevista = transcripcion.length > 0;
   const referencias = String(candidato.referencias || '').trim();
-  const hayReferencias = referencias.length > 0;
-
   // Se evalua contra la guia que el consultor uso (CV ajustado por DISC); si no hay guia, contra las del CV
   const guiaObj = candidato.guia_entrevista ? safeParse(candidato.guia_entrevista) : null;
   const preguntas = (guiaObj && Array.isArray(guiaObj.guia) && guiaObj.guia.length) ? guiaObj.guia : parseLista(candidato.preguntas);
-  const brechas = parseLista(candidato.brechas);
-  const fortalezas = parseLista(candidato.fortalezas);
   const lectCV = candidato.cv_lectura ? safeParse(candidato.cv_lectura) : null;
+  const lectura = lectCV && typeof lectCV === 'object' ? lectCV : null;
   // los excluyentes con el MISMO texto que uso la lectura del CV (asi la entrevista puede confirmar o levantar cada uno)
-  const perfilCal = busqueda && busqueda.perfil_calibrado ? safeParse(busqueda.perfil_calibrado) : null;
-  const excluyentesPuesto = (lectCV && Array.isArray(lectCV.excluyentes) && lectCV.excluyentes.length) ? lectCV.excluyentes.map(x => x.requisito)
+  const perfilCal = busqueda.perfil_calibrado ? safeParse(busqueda.perfil_calibrado) : null;
+  const todosExcl = (lectura && Array.isArray(lectura.excluyentes) && lectura.excluyentes.length) ? lectura.excluyentes.map(x => x.requisito)
     : (perfilCal && Array.isArray(perfilCal.excluyentes) && perfilCal.excluyentes.length) ? perfilCal.excluyentes.map(x => x.texto)
     : separarLista(busqueda.deal_breakers, true);
-  const integ = candidato.integridad ? safeParse(candidato.integridad) : null;
+  // v2.7.2: las competencias que estaban cargadas como excluyentes se evaluan como competencias (en escala, sin tope)
+  const excluyentesPuesto = todosExcl.filter(x => !esCompetenciaBlanda(x));
+  let competenciasPuesto = todosExcl.filter(esCompetenciaBlanda);
+  if (!competenciasPuesto.length && perfilCal && Array.isArray(perfilCal.requisitos)) competenciasPuesto = perfilCal.requisitos.filter(r => r.origen === 'deal_breakers').map(r => String(r.texto || '').replace(/^Competencia:\s*/i, ''));
+  if (!competenciasPuesto.length) competenciasPuesto = separarLista(busqueda.deal_breakers, true).filter(esCompetenciaBlanda);
+  // v2.8: requisitos que la entrevista puede validar (los que calcula el sistema con fechas no se tocan)
+  const requisitosEnt = lectura && lectura.version === 'v4' && Array.isArray(lectura.requisitos)
+    ? lectura.requisitos.filter(r => !r.calculado && !esRequisitoVacio(r.requisito)) : [];
+  return {
+    busqueda, transcripcion, hayEntrevista: transcripcion.length > 0, referencias, hayReferencias: referencias.length > 0,
+    preguntas, brechas: parseLista(candidato.brechas), fortalezas: parseLista(candidato.fortalezas), lectura,
+    excluyentesPuesto, competenciasPuesto, requisitosEnt,
+    integ: candidato.integridad ? safeParse(candidato.integridad) : null,
+    disc: candidato.disc_resultado ? safeParse(candidato.disc_resultado) : null,
+    portfolio: candidato.portfolio_analisis ? safeParse(candidato.portfolio_analisis) : null
+  };
+}
 
-  const listaPreg = preguntas.map((p, i) => (i + 1) + '. ' + (p.pregunta || p) +
+function promptClasificacion(candidato, ctx) {
+  const listaPreg = ctx.preguntas.map((p, i) => (i + 1) + '. ' + (p.pregunta || p) +
     (p.objetivo ? '\n   Objetivo: ' + p.objetivo : '') + (p.buenaRespuesta ? '\n   Buena respuesta: ' + p.buenaRespuesta : '') + (p.redFlag ? '\n   Red flag: ' + p.redFlag : '')).join('\n');
-
-  const bloqueEntrevista = hayEntrevista ? `
-TRANSCRIPCION COMPLETA DE LA ENTREVISTA (grabada y transcripta por el consultor Hernan Salas):
+  const resCV = r => r.resultado === 'CUMPLE' && r.evidencia === 'AUTODECLARADO' ? 'DECLARADO (figura sin un trabajo que lo respalde)' : r.resultado;
+  const integ = ctx.integ;
+  const bloqueEntrevista = ctx.hayEntrevista ? `
+TRANSCRIPCION COMPLETA DE LA ENTREVISTA (grabada por el consultor Hernan Salas y pasada a texto con un programa):
 """
-${transcripcion.substring(0, 80000)}
+${ctx.transcripcion.substring(0, 80000)}
 """
 
 PREGUNTAS DE LA GUIA DE ENTREVISTA QUE SUGIRIO APTIA (el consultor se baso en ellas):
 ${listaPreg || '(no hay)'}
 
 BRECHAS DETECTADAS EN EL CV:
-${brechas.map((b, i) => (i + 1) + '. ' + b).join('\n') || '(no hay)'}
+${ctx.brechas.map((b, i) => (i + 1) + '. ' + b).join('\n') || '(no hay)'}
 
 FORTALEZAS DETECTADAS EN EL CV:
-${fortalezas.map((f, i) => (i + 1) + '. ' + f).join('\n') || '(no hay)'}
+${ctx.fortalezas.map((f, i) => (i + 1) + '. ' + f).join('\n') || '(no hay)'}
 
-TU TAREA CON LA ENTREVISTA ES CLASIFICAR, NO PUNTUAR. Reglas estrictas:
-- Cada clasificacion lleva "cita": un fragmento COPIADO TEXTUAL de lo que dijo el CANDIDATO en la transcripcion (entre 8 y 40 palabras, sin cambiar ni corregir nada). Sin cita textual, la clasificacion se anula.
-- Si algo no se hablo en la entrevista, decilo (NO PREGUNTADA / NO TRATADA). No supongas ni completes con lo que dice el CV.
+TU TAREA CON LA ENTREVISTA ES CLASIFICAR, NO PUNTUAR. Reglas:
+- Cada clasificacion lleva "cita": un fragmento COPIADO TEXTUAL de lo que dijo el CANDIDATO en la transcripcion (entre 8 y 40 palabras, tal cual esta escrito, aunque tenga errores). Sin cita textual, la clasificacion se anula.
+- LA TRANSCRIPCION ES AUTOMATICA: tiene palabras mal transcriptas, sobre todo nombres de empresas, personas, lugares y sistemas (por ejemplo "AZCUY" puede salir "Hascouet" y "Tokko" puede salir "Toco"), frases cortadas y puntuacion rara. Interpreta lo que la persona quiso decir por el contexto, como lo haria quien estuvo en la entrevista. Un nombre mal escrito NUNCA es una contradiccion ni significa que no respondio.
+- EVALUA POR TEMA, NO POR PREGUNTA LITERAL. Una entrevista real no sigue la guia al pie de la letra: el candidato muchas veces responde un tema dentro de otra respuesta o contando otra cosa, y el consultor no repite la pregunta porque ya quedo contestada (repetirla seria forzado). Para cada pregunta, brecha, fortaleza, requisito, competencia y excluyente busca en TODA la transcripcion; si el tema aparece en cualquier parte, clasificalo con eso y cita ese fragmento.
+- "NO PREGUNTADA" / "NO TRATADA" / "NO TRATADO" / "SIN CAMBIO" solo si el tema NO aparece en NINGUN momento de la entrevista. No supongas ni completes con lo que dice el CV.
 - Juzga por el CONTENIDO de las respuestas, no por nervios, muletillas o forma de hablar.
 - Evaluacion sin sesgos: no consideres edad, genero, acento, apariencia, situacion familiar ni datos personales.
-- Metodo STAR: una buena respuesta cuenta una Situacion real, la Tarea, la Accion que hizo EL/ELLA (no "el equipo") y el Resultado. Compara con la "Buena respuesta" esperada de cada pregunta.
+- Referencia STAR (Situacion, Tarea, Accion propia, Resultado) como guia, NO como formato obligatorio: en una charla natural casi nadie responde con las cuatro partes. Un ejemplo real de su experiencia que muestre lo que la pregunta busca validar alcanza para CONFIRMA.
 
 Para CADA pregunta sugerida (en el mismo orden), "resultado" es uno de:
-  "CONFIRMA"      cuenta una situacion concreta, con su accion propia y un resultado, y cumple la buena respuesta esperada
-  "PARCIAL"       responde pero en general o en teoria, sin caso concreto, o le falta su accion propia o el resultado
-  "NO SOSTIENE"   no puede sostener lo que la pregunta buscaba validar
+  "CONFIRMA"      muestra con un ejemplo o una experiencia real (en esa respuesta o en otra parte de la entrevista) lo que la pregunta busca validar
+  "PARCIAL"       toca el tema pero solo en general o en teoria, sin ningun ejemplo propio
+  "NO SOSTIENE"   lo que dijo muestra que NO tiene lo que la pregunta buscaba validar
   "RED FLAG"      la respuesta coincide con la red flag indicada
-  "NO PREGUNTADA" no se hizo esa pregunta ni una equivalente
+  "NO PREGUNTADA" el tema no aparece en ningun momento de la entrevista
 Para CADA brecha del CV: "CERRADA" (demostro que no es brecha), "REDUCIDA" (la achica en parte), "SIN CAMBIO", "AMPLIADA" (la entrevista la confirma o la agranda), "NO TRATADA".
-Para CADA fortaleza del CV: "CONFIRMADA" (la respalda con ejemplos), "SIN EVIDENCIA" (se hablo pero no la respaldo), "CONTRADICHA" (lo que dijo contradice el CV), "NO TRATADA".
+Para CADA fortaleza del CV: "CONFIRMADA" (la respalda con ejemplos), "SIN EVIDENCIA" (se hablo pero no la respaldo), "CONTRADICHA" (lo que dijo contradice claramente el CV; nunca por un nombre mal transcripto), "NO TRATADA".
 
-EXCLUYENTES REALES DEL PUESTO (validalos con lo que dijo):
-${excluyentesPuesto.length ? excluyentesPuesto.map((x, i) => (i + 1) + '. ' + x).join('\n') : '(no hay)'}
-Para CADA excluyente: "CUMPLE" o "NO CUMPLE" (con cita de lo que dijo el candidato) o "NO TRATADO".
+REQUISITOS DEL PUESTO Y LO QUE MOSTRO EL CV (validalos con lo que conto en la entrevista):
+${ctx.requisitosEnt.length ? ctx.requisitosEnt.map(r => r.id + ' · ' + r.criticidad + ' · ' + r.requisito + ' — en el CV: ' + resCV(r)).join('\n') : '(no hay)'}
+Para CADA requisito: "CUMPLE" (conto una experiencia o un ejemplo concreto que lo muestra), "PARCIAL" (lo muestra en parte), "NO CUMPLE" (SOLO si dijo explicitamente que no lo tiene o no lo hizo) o "SIN CAMBIO" (la entrevista no agrega nada sobre esto). Con "cita" de lo que dijo.
 
-CONTRADICCIONES: busca datos concretos en los que la entrevista contradiga al CV (fechas, empresas, cargos, tareas, herramientas, motivos de salida). Cada una con "citaCV" (textual del CV) y "citaEntrevista" (textual de lo que dijo). Solo hechos, no matices. Si no hay, lista vacia.
-${integ && Array.isArray(integ.alertas) && integ.alertas.length ? 'ALERTAS DEL CV PARA TENER EN CUENTA (no las repitas como hechos; si la entrevista las aclara, decilo en puntosAtencion internos): ' + integ.alertas.map(a => a.titulo + ': ' + a.detalle).join(' | ') : ''}
+COMPETENCIAS CENTRALES DEL PUESTO (evaluarlas como competencias, en escala; NO son excluyentes):
+${ctx.competenciasPuesto.length ? ctx.competenciasPuesto.map((x, i) => (i + 1) + '. ' + x).join('\n') : '(no hay)'}
+Para CADA competencia: "DEMOSTRADA" (lo que conto de su experiencia la muestra), "PARCIAL" (algo se ve pero sin ejemplos claros), "NO DEMOSTRADA" (lo que dijo va en contra de esa competencia) o "NO TRATADA" (no aparece nada). Se juzga por lo que conto en TODA la entrevista, aunque no se haya preguntado de forma directa.
 
-CV DEL CANDIDATO (para buscar las citas del CV):
+EXCLUYENTES REALES DEL PUESTO (condiciones: horario, zona, movilidad, titulo, etc.):
+${ctx.excluyentesPuesto.length ? ctx.excluyentesPuesto.map((x, i) => (i + 1) + '. ' + x).join('\n') : '(no hay)'}
+Para CADA excluyente:
+  "CUMPLE"     lo que dijo muestra que cumple (cita)
+  "NO CUMPLE"  SOLO si el candidato dijo EXPLICITAMENTE que no cumple (ej. "los sabados no puedo", "no tengo movilidad"), con la cita de esa frase. Que no se haya hablado, o que no haya quedado claro, NUNCA es NO CUMPLE.
+  "NO TRATADO" no se hablo o no quedo claro (queda a validar por el consultor)
+
+CONTRADICCIONES: solo diferencias DE FONDO entre lo que dijo y el CV (cargo, tareas, fechas o duracion, motivo de salida, titulo). NO son contradicciones: un nombre que suena parecido (error de transcripcion), un dato nuevo que el CV no tenia (otro trabajo, otro detalle) ni una forma distinta de contar lo mismo. "resultado": "CONTRADICCION" (lo que dijo contradice claramente el CV) o "A ACLARAR" (puede ser un malentendido o falta de contexto). Cada una con "citaCV" (textual del CV) y "citaEntrevista" (textual de lo que dijo). Si no hay, lista vacia.
+${integ && Array.isArray(integ.alertas) && integ.alertas.some(a => a.nivel !== 'INFO') ? 'ALERTAS DEL CV PARA TENER EN CUENTA (si la entrevista las aclara, decilo en el motivo de la pregunta correspondiente): ' + integ.alertas.filter(a => a.nivel !== 'INFO').map(a => a.titulo + ': ' + a.detalle).join(' | ') : ''}
+
+CV DEL CANDIDATO (para buscar las citas del CV) — sin datos personales ni instrucciones para la IA:
 """
-${String(candidato.cv_texto || '').substring(0, 40000)}
+${ocultarDatosSensibles(limpiarInstrucciones(String(candidato.cv_texto || '')).texto).texto.substring(0, 40000)}
 """
-` : '\nNO HAY ENTREVISTA REGISTRADA: en "preguntas", "brechas", "fortalezas", "excluyentes" y "contradicciones" devolve listas vacias.\n';
+` : '\nNO HAY ENTREVISTA REGISTRADA: en "preguntas", "brechas", "fortalezas", "requisitos", "competencias", "excluyentes" y "contradicciones" devolve listas vacias.\n';
 
-  const bloqueReferencias = hayReferencias ? `
+  const bloqueReferencias = ctx.hayReferencias ? `
 REFERENCIAS LABORALES (notas de las llamadas que hizo el consultor a ex jefes o colegas):
 """
-${referencias.substring(0, 20000)}
+${ctx.referencias.substring(0, 20000)}
 """
 Para cada dato relevante de las referencias: "tema", "persona" (quien lo dijo, si figura), "resultado" = "CONFIRMA" (respalda algo del CV o de la entrevista), "CONTRADICE" (dice lo contrario) o "NEUTRO", "cita" (copiada textual de las notas de referencias) y, si contradice o confirma algo puntual del CV, "citaCV" (textual del CV).
 ` : '';
 
-  const prompt = `Genera el informe final integrado de este candidato para presentar al cliente.
+  return `Sos un selector de RRHH con mucha experiencia. Ahora tu tarea es CLASIFICAR la evidencia de la entrevista${ctx.hayReferencias ? ' y de las referencias' : ''} de ${candidato.nombre || 'el candidato'}. No escribas el informe ni pongas puntajes: el sistema calcula el resultado con reglas fijas y el informe se redacta despues.
 
 PERFIL DEL PUESTO:
-${perfilTexto(busqueda)}
-
-SCORE TECNICO (CV vs puesto): ${candidato.score}/100 — ${candidato.recomendacion}
-RESUMEN TECNICO: ${candidato.resumen || '-'}
-
-ANALISIS DISC: ${disc ? JSON.stringify(disc) : 'No realizado'}
-COMPATIBILIDAD DISC: ${candidato.disc_compatibilidad != null ? candidato.disc_compatibilidad + '/100' : 's/d'}
-
-PORTFOLIO: ${portfolio ? JSON.stringify(portfolio) : 'No evaluado'}
+${perfilTexto(ctx.busqueda)}
 ${bloqueEntrevista}${bloqueReferencias}
-NO calcules ningun score ni veredicto: los calcula el sistema con reglas fijas a partir de tu clasificacion.
-
-LENGUAJE PARA EL CLIENTE: resumenEjecutivo, fortalezasPrincipales, puntosAtencion, perfilConductualCliente y cierreConsultor los lee un cliente que NO conoce el modelo DISC.
-- NUNCA uses letras sueltas ni combinaciones (D, I, S, C, "C/I", "perfil D alto", "factor S") ni jerga tecnica ("natural/adaptado", "tension").
-- Describi el comportamiento en palabras comunes y en que se nota en el trabajo. Ej: en vez de "perfil D/I" -> "orientada a resultados y con facilidad para vincularse y persuadir".
-- Referencia interna (no la copies, traducila): D = orientacion a resultados, decision, desafio; I = sociabilidad, persuasion, entusiasmo; S = constancia, paciencia, trabajo en equipo estable; C = precision, analisis, apego a normas y calidad.
-
 Devolve SOLO este JSON:
 {
   "clasificacion": {
     "preguntas":  [{"pregunta": "texto de la pregunta sugerida", "resultado": "...", "cita": "textual del candidato", "motivo": "1 linea"}],
     "brechas":    [{"brecha": "texto de la brecha", "resultado": "...", "cita": "textual", "motivo": "1 linea"}],
     "fortalezas": [{"fortaleza": "texto de la fortaleza", "resultado": "...", "cita": "textual", "motivo": "1 linea"}],
+    "requisitos": [{"id": "R1", "resultado": "CUMPLE|PARCIAL|NO CUMPLE|SIN CAMBIO", "cita": "textual de lo que dijo", "motivo": "1 linea"}],
+    "competencias": [{"competencia": "texto de la competencia", "resultado": "DEMOSTRADA|PARCIAL|NO DEMOSTRADA|NO TRATADA", "cita": "textual de lo que dijo", "motivo": "1 linea"}],
     "excluyentes": [{"requisito": "texto del excluyente", "resultado": "CUMPLE|NO CUMPLE|NO TRATADO", "cita": "textual de lo que dijo", "motivo": "1 linea"}],
-    "contradicciones": [{"tema": "...", "citaCV": "textual del CV", "citaEntrevista": "textual de lo que dijo", "motivo": "1 linea"}],
+    "contradicciones": [{"tema": "...", "resultado": "CONTRADICCION|A ACLARAR", "citaCV": "textual del CV", "citaEntrevista": "textual de lo que dijo", "motivo": "1 linea"}],
     "referencias": [{"tema": "...", "persona": "...", "resultado": "CONFIRMA|CONTRADICE|NEUTRO", "cita": "textual de las notas de referencias", "citaCV": "textual del CV o vacio"}]
-  },
-  "resumenEjecutivo": "4-6 lineas que sinteticen tecnico + conductual + entrevista, solo con hechos de los datos",
-  "fortalezasPrincipales": ["...", "..."],
-  "puntosAtencion": ["...", "..."],
-  "perfilConductualCliente": "3-4 lineas en lenguaje llano: como trabaja esta persona, que la motiva y que conviene tener en cuenta para liderarla en este puesto (sin letras DISC)",
-  "cierreConsultor": "parrafo final con la recomendacion de APTIA para el cliente, tono profesional"
+  }
 }`;
+}
 
-  const informe = await callClaude(prompt, 8000, 0);
-  const clasif = (hayEntrevista || hayReferencias) ? (informe.clasificacion || null) : null;
-  const evalEnt = clasif ? evaluarEntrevista(clasif, transcripcion, candidato.cv_texto, referencias) : null;
-  delete informe.clasificacion;
-  traducirDISCParaCliente(informe);
-  informe.evaluacionEntrevista = evalEnt;
+// Estilo natural del test conductual en palabras (para el cliente no van letras ni porcentajes)
+const ESTILO_FACTOR = { D: 'orientacion a resultados y decision', I: 'sociabilidad y persuasion', S: 'constancia y paciencia', C: 'analisis, orden y precision' };
+function estiloConductual(disc) {
+  if (!disc || typeof disc !== 'object' || !Array.isArray(disc.factores)) return null;
+  const val = f => { const n = num(f.valorNatural); return n != null ? n : ({ ALTO: 70, MEDIO: 50, BAJO: 30 })[String(f.nivelCandidato || '').toUpperCase()] || 0; };
+  const fs = disc.factores.filter(f => ESTILO_FACTOR[String(f.factor || '').toUpperCase()]).slice().sort((a, b) => val(b) - val(a));
+  if (!fs.length) return null;
+  const altos = fs.filter(f => String(f.nivelCandidato || '').toUpperCase() === 'ALTO').slice(0, 2);
+  const top = altos.length ? altos : fs.slice(0, 1);
+  return { factores: top.map(f => String(f.factor).toUpperCase()), texto: top.map(f => ESTILO_FACTOR[String(f.factor).toUpperCase()]).join(' + ') };
+}
+
+function promptRedaccion(candidato, ctx, evalEnt, calc, veredicto) {
+  const d = evalEnt && evalEnt.detalle ? evalEnt.detalle : null;
+  const comp = calc.desglose.componentes || [];
+  const L = ctx.lectura;
+  const valeItem = it => it.corregido || it.verificada === true;
+  const lista = (arr, f) => (arr || []).filter(Boolean).map(f).filter(Boolean).join('\n') || '(nada)';
+  const conCita = it => it.cita ? ' — "' + String(it.cita).substring(0, 220) + '"' : '';
+  const reqs = calc.desglose.requisitos || (L && Array.isArray(L.requisitos) ? L.requisitos : []);
+  const disc = ctx.disc && typeof ctx.disc === 'object' ? ctx.disc : null;
+  const estilo = estiloConductual(disc);
+  const conf = disc && disc.validez ? disc.validez.confiabilidad : null;
+  const contr = d ? (d.contradicciones || []).filter(c => c.resultado === 'A ACLARAR' && valeItem(c)) : [];
+  // v2.8.1: lo que NO cuadra tiene que estar en el informe del cliente (un informe honesto no lo esconde)
+  // alertas del CV que son hechos que no cuadran (manipulacion, años inflados, rotacion alta, pretension fuera de rango)
+  const esNoCuadra = a => a.nivel === 'ALTA' || (a.nivel === 'MEDIA' && ['instrucciones', 'oculto', 'relleno', 'anios', 'rotacion', 'salario'].includes(a.tipo));
+  const alertasAltas = ctx.integ && Array.isArray(ctx.integ.alertas) ? ctx.integ.alertas.filter(esNoCuadra) : [];
+  const noCuadra = [].concat(
+    d ? (d.preguntas || []).filter(p => valeItem(p) && (p.resultado === 'NO SOSTIENE' || p.resultado === 'RED FLAG')).map(p => (p.resultado === 'RED FLAG' ? 'Respuesta que coincide con una señal de alerta' : 'Respuesta que no sostiene lo que se buscaba validar') + ': ' + p.pregunta + conCita(p) + (p.motivo ? ' (' + p.motivo + ')' : '')) : [],
+    d ? (d.requisitos || []).filter(r => r.cuenta && r.resultado === 'NO CUMPLE').map(r => 'Requisito del puesto que dijo no tener: ' + r.requisito + conCita(r)) : [],
+    d ? (d.competencias || []).filter(c => valeItem(c) && c.resultado === 'NO DEMOSTRADA').map(c => 'Competencia que lo que conto no muestra: ' + c.competencia + conCita(c)) : [],
+    d ? (d.fortalezas || []).filter(f => valeItem(f) && f.resultado === 'CONTRADICHA').map(f => 'Fortaleza del CV que la entrevista contradice: ' + f.fortaleza + conCita(f)) : [],
+    d ? (d.brechas || []).filter(b => valeItem(b) && b.resultado === 'AMPLIADA').map(b => 'Brecha del CV que la entrevista confirma: ' + b.brecha + conCita(b)) : [],
+    d ? (d.contradicciones || []).filter(c => valeItem(c) && c.resultado === 'CONTRADICCION').map(c => 'Lo que dijo contradice el CV (' + c.tema + '): CV "' + c.citaCV + '" / entrevista "' + c.citaEntrevista + '"') : [],
+    d ? (d.referencias || []).filter(r => r.verificada && r.resultado === 'CONTRADICE').map(r => 'Una referencia laboral contradice: ' + r.tema + (r.persona ? ' (' + r.persona + ')' : '') + conCita(r)) : [],
+    d ? (d.excluyentes || []).filter(x => !x.competencia && valeItem(x) && x.resultado === 'NO CUMPLE').map(x => 'Excluyente que dijo no cumplir: ' + x.requisito + conCita(x)) : [],
+    alertasAltas.map(a => 'Alerta del CV: ' + a.titulo + ' — ' + a.detalle)
+  );
+  const exclATratar = d ? (d.excluyentes || []).filter(x => !x.competencia && x.resultado === 'NO TRATADO').map(x => x.requisito) : ctx.excluyentesPuesto;
+  const alertas = ctx.integ && Array.isArray(ctx.integ.alertas) ? ctx.integ.alertas.filter(a => a.nivel !== 'INFO' && !(a.nivel === 'ALTA' || (a.nivel === 'MEDIA' && ['instrucciones', 'oculto', 'relleno', 'anios', 'rotacion', 'salario'].includes(a.tipo)))) : [];
+  const corr = d ? Object.keys(CORRECCION_TIPOS).reduce((acc, tipo) => acc.concat((d[CORRECCION_TIPOS[tipo].lista] || []).filter(x => x.corregido).map(x => tipo + ' "' + x[CORRECCION_TIPOS[tipo].campo] + '": ' +
+    (x.resultadoIA === x.resultado ? 'el consultor (que estuvo en la entrevista) confirma que cuenta: ' + x.resultado : 'la lectura automatica puso ' + x.resultadoIA + ' y el consultor (que estuvo en la entrevista) lo corrigio a ' + x.resultado))), []) : [];
+  const tono = veredicto === 'RECOMENDADO'
+    ? 'RECOMENDADO: el resumen y el cierre recomiendan avanzar, sin esconder lo que conviene profundizar.'
+    : veredicto === 'RECOMENDADO CON OBSERVACIONES'
+    ? 'RECOMENDADO CON OBSERVACIONES: se recomienda avanzar, dejando claro que conviene validar con el cliente uno o dos puntos concretos.'
+    : 'NO RECOMENDADO: explica con respeto y claridad por que no es el perfil para ESTE puesto (sin descalificar a la persona), reconociendo lo que si tiene.';
+
+  return `Sos un consultor senior de seleccion de APTIA ("Seleccion Inteligente y Humana"). ${candidato.nombre || 'El candidato'} ya fue evaluado/a para este puesto: el resultado esta DECIDIDO y abajo tenes la evidencia verificada. Tu tarea es REDACTAR el informe que va a leer el cliente, como lo escribiria el mejor selector humano: justo, claro, respetuoso de la persona, con contexto y util para decidir.
+
+PUESTO:
+${perfilTexto(ctx.busqueda)}
+${ctx.busqueda.salario_desde || ctx.busqueda.salario_hasta ? 'Rango salarial del cliente: ' + (ctx.busqueda.salario_desde || '?') + ' a ' + (ctx.busqueda.salario_hasta || '?') + ' ' + (ctx.busqueda.moneda || '') : ''}
+${ctx.busqueda.notas_perfil ? 'Lo que el cliente valora o descarta: ' + ctx.busqueda.notas_perfil : ''}
+
+RESULTADO (lo calculo el sistema: no lo cambies, no lo discutas y no pongas numeros en el texto):
+- Score APTIA: ${calc.scoreFinal}% · Veredicto: ${veredicto}
+${comp.map(c => '- ' + c.nombre + ': ' + c.valor + '%').join('\n')}
+${calc.desglose.excluyentesIncumplidos && calc.desglose.excluyentesIncumplidos.length ? '- Excluyente no cumplido: ' + calc.desglose.excluyentesIncumplidos.join('; ') : ''}
+${calc.desglose.ajusteConsultor ? '- Impresion del consultor que estuvo en la entrevista (' + (calc.desglose.ajusteConsultor > 0 ? '+' : '') + calc.desglose.ajusteConsultor + '): ' + (calc.desglose.ajusteConsultorMotivo || '') : ''}
+
+LO QUE MUESTRA EL CV:
+Resumen: ${candidato.resumen || '-'}
+${L && L.lecturaIntegral ? 'Lectura del CV: ' + L.lecturaIntegral : (candidato.lectura_humana ? 'Lectura del CV: ' + candidato.lectura_humana : '')}
+Trayectoria: ${L && Array.isArray(L.experiencias) && L.experiencias.length ? L.experiencias.slice(0, 10).map(e => (e.puesto || '?') + ' en ' + (e.empresa || '?') + ' (' + (e.desde || '?') + ' a ' + (e.hasta || '?') + ')').join(' · ') : 's/d'}
+Requisitos del puesto (estado final, CV + entrevista):
+${lista(reqs.filter(r => !r.ignorado && !r.plus), r => '- ' + r.requisito + ': ' + (r.resultado === 'CUMPLE' && r.evidencia === 'AUTODECLARADO' ? 'declarado en el CV' : r.resultado) + (r.fuente === 'ENTREVISTA' ? ' (validado en la entrevista)' : ''))}
+${d ? `
+LO QUE SE VIO EN LA ENTREVISTA (verificado con citas de lo que dijo):
+Preguntas:
+${lista(d.preguntas, p => p.resultado === 'NO PREGUNTADA' || !valeItem(p) ? null : '- [' + p.resultado + '] ' + p.pregunta + conCita(p) + (p.motivo ? ' (' + p.motivo + ')' : ''))}
+Competencias del puesto:
+${lista(d.competencias, c => c.resultado === 'NO TRATADA' || !valeItem(c) ? null : '- [' + c.resultado + '] ' + c.competencia + conCita(c))}
+Requisitos que la entrevista valido:
+${lista(d.requisitos, r => !r.cuenta ? null : '- [' + r.resultado + '] ' + r.requisito + ' (en el CV: ' + r.resultadoCV + ')' + conCita(r))}
+Fortalezas del CV:
+${lista(d.fortalezas, f => f.resultado === 'NO TRATADA' || !valeItem(f) ? null : '- [' + f.resultado + '] ' + f.fortaleza + conCita(f))}
+Brechas del CV:
+${lista(d.brechas, b => b.resultado === 'NO TRATADA' || (!valeItem(b) && b.resultado !== 'SIN CAMBIO') ? null : '- [' + b.resultado + '] ' + b.brecha + conCita(b))}
+Referencias laborales:
+${lista(d.referencias, r => !r.verificada ? null : '- [' + r.resultado + '] ' + r.tema + (r.persona ? ' (' + r.persona + ')' : '') + conCita(r))}
+${corr.length ? 'CORRECCIONES DEL CONSULTOR (mandan sobre la lectura automatica):\n' + corr.map(x => '- ' + x).join('\n') : ''}
+
+TRANSCRIPCION DE LA ENTREVISTA (automatica, puede tener palabras y nombres mal escritos; usala para entender el contexto y dar ejemplos concretos):
+"""
+${ctx.transcripcion.substring(0, 50000)}
+"""` : '\nTodavia no hay entrevista: el informe se basa en el CV' + (disc ? ' y la evaluacion conductual' : '') + '.'}
+${disc ? `
+EVALUACION CONDUCTUAL (test DISC). Es ORIENTATIVA: describe tendencias naturales de comportamiento, NO capacidades, y no suma ni resta en el resultado.
+Estilo natural predominante: ${estilo ? estilo.texto : 's/d'}
+Lectura del estilo: ${disc.perfilResumen || '-'}
+Que la motiva: ${(disc.motivadores || []).join('; ') || '-'}
+Como liderarla: ${disc.estiloGestion || '-'}
+Bajo presion: ${disc.bajoPresion || '-'}
+Aportes de su estilo al puesto: ${(disc.fortalezasConductuales || []).join('; ') || '-'}
+Aspectos a acompañar segun el test: ${(disc.areasAtencion || []).join('; ') || '-'}
+${conf && conf !== 'ALTA' ? 'Confiabilidad del test: ' + conf + ' (' + ((disc.validez && disc.validez.motivos) || []).join(', ') + '): tomalo con mas cautela todavia.' : ''}` : ''}
+${ctx.portfolio && ctx.portfolio.adecuacionAlPuesto ? '\nPORTFOLIO: ' + ctx.portfolio.adecuacionAlPuesto : ''}
+
+LO QUE NO CUADRA (verificado; tiene que estar en "puntosAtencion" con el dato concreto, dicho con respeto: no lo escondas ni lo exageres):
+${noCuadra.map(x => '- ' + x).join('\n') || '(nada relevante en la evidencia verificada)'}
+
+DATOS PARA EL CONSULTOR (NO van en el texto del cliente; usalos solo para "pendientesConsultor"):
+${[].concat(
+    alertas.map(a => 'Alerta del CV: ' + a.titulo + ' — ' + a.detalle),
+    contr.map(c => 'Diferencia CV/entrevista a aclarar (puede ser un malentendido): ' + c.tema + ' — CV: "' + c.citaCV + '" / entrevista: "' + c.citaEntrevista + '"'),
+    exclATratar.map(x => 'Excluyente que no quedo confirmado: ' + x)
+  ).map(x => '- ' + x).join('\n') || '(nada)'}
+
+COMO ESCRIBIR (criterio de un selector humano):
+1. Coherente con el veredicto. ${tono}
+2. Lo central es la ENTREVISTA: interpreta sus respuestas (que muestran de como trabaja, como resuelve los problemas, como se vincula con clientes y equipos, que la motiva) y usalas como base de las fortalezas y de los aspectos a profundizar. El CV es el contexto. Usa hechos concretos y nombrala por su nombre.
+3. HONESTIDAD: todo lo que figura en "LO QUE NO CUADRA" va en "puntosAtencion" con el dato concreto, aunque el veredicto sea RECOMENDADO. No digas que todo es excelente cuando hay cosas que no cuadran, y tampoco exageres lo menor ni rellenes. "fortalezasPrincipales": 3 a 5, cada una con un hecho concreto. "puntosAtencion": lo que no cuadra mas lo realmente relevante para decidir (con RECOMENDADO y nada que no cuadre, 1 o 2). Escribilos con respeto: que paso y que conviene profundizar.
+4. Cada tema aparece UNA sola vez en todo el informe: no repitas el mismo punto en el resumen, los aspectos y el cierre.
+5. Lo que no se hablo en la entrevista NO es un defecto de la persona: nunca escribas "no se pregunto", "no surgio" o "no aporto en la entrevista". Si es importante, va en "pendientesConsultor".
+6. Datos a verificar (titulos, fechas, nombres de empresas, diferencias entre el CV y la entrevista, excluyentes sin confirmar, referencias por pedir) van SOLO en "pendientesConsultor". En el texto del cliente nunca escribas tareas para el consultor ("antes de presentarla", "conviene confirmar").
+7. La transcripcion es automatica: un nombre mal escrito (empresa, persona, lugar) no es una contradiccion. No lo menciones.
+8. Conductual: es un pequeño informe de interpretacion humana del resultado: como trabaja segun su estilo natural, que la motiva, como reacciona bajo presion, como conviene comunicarse con ella y como acompañarla en ESTE puesto. Es una tendencia, no una capacidad: nunca digas que le falta paciencia, calidez, empatia u otra capacidad por lo que dice el test. Si la experiencia o la entrevista confirman o matizan el test, decilo; si muestran el comportamiento, eso manda (ej.: "su estilo natural es mas analitico; en su experiencia acompaña a los equipos a traves de procesos y seguimiento"). No lo uses como punto en contra.
+9. Pretension salarial dentro del rango del cliente no es un punto de atencion.
+10. Solo hechos del CV, la entrevista o las referencias. No inventes datos ni numeros.
+11. Lenguaje para el cliente: sin siglas DISC (D, I, S, C), sin jerga ("natural/adaptado", "tension", "STAR", "cita", "score", "requisito CORE") y sin porcentajes.
+
+Devolve SOLO este JSON:
+{
+  "resumenEjecutivo": "5 a 7 lineas: quien es profesionalmente, que aporta a este puesto (con hechos) y la conclusion, coherente con el veredicto",
+  "fortalezasPrincipales": ["3 a 5, cada una con un hecho concreto"],
+  "puntosAtencion": ["lo que no cuadra y los aspectos a profundizar, segun la regla 3"],
+  "perfilConductualCliente": "${disc ? '4 a 6 lineas en lenguaje llano (regla 8): interpretacion humana del resultado del test para este puesto' : 'vacio (no hay evaluacion conductual)'}",
+  "cierreConsultor": "4 a 6 lineas: la recomendacion de APTIA coherente con el veredicto, por que (2 o 3 razones concretas) y que conviene profundizar en la entrevista con el cliente",
+  "pendientesConsultor": ["notas internas para el consultor (el cliente no las ve): que verificar o aclarar antes de presentar. Lista vacia si no hay"]
+}`;
+}
+
+// Lo que es tarea del consultor (verificar, "no se pregunto") no va en el texto del cliente. Lo que no cuadra SI va.
+const RE_TAREA_INTERNA = /\b(no se (le )?(pregunt|indag|profundiz|habl|trat)|no surgi[oó]|antes de presentarl|conviene (confirmar|verificar|chequear)|verificar si|transcripci[oó]n)/i;
+function pulirTextosInforme(t, veredicto) {
+  const arr = v => (Array.isArray(v) ? v : []).map(x => String(x || '').trim()).filter(Boolean);
+  const out = {
+    resumenEjecutivo: String(t.resumenEjecutivo || '').trim(),
+    fortalezasPrincipales: arr(t.fortalezasPrincipales).slice(0, 5),
+    puntosAtencion: arr(t.puntosAtencion),
+    perfilConductualCliente: String(t.perfilConductualCliente || '').trim().replace(/^vac[ií]o.*$/i, ''),
+    cierreConsultor: String(t.cierreConsultor || '').trim(),
+    pendientesConsultor: arr(t.pendientesConsultor)
+  };
+  out.puntosAtencion = out.puntosAtencion.filter(p => { if (RE_TAREA_INTERNA.test(p)) { out.pendientesConsultor.push(p); return false; } return true; });
+  ['resumenEjecutivo', 'cierreConsultor', 'perfilConductualCliente'].forEach(k => {
+    const frases = out[k].split(/(?<=[.!?])\s+/);
+    const quedan = frases.filter(f => { if (RE_TAREA_INTERNA.test(f) && frases.length > 2) { out.pendientesConsultor.push(f); return false; } return true; });
+    out[k] = quedan.join(' ');
+  });
+  // v2.8.1: no se recorta por proporcion (eso podia esconder algo que no cuadra); solo un tope de prolijidad
+  if (out.puntosAtencion.length > 6) out.puntosAtencion.splice(6).forEach(p => out.pendientesConsultor.push('Para tener en cuenta: ' + p));
+  out.pendientesConsultor = out.pendientesConsultor.slice(0, 8);
+  return out;
+}
+
+async function redactarInforme(candidato, ctx, evalEnt, calc, veredicto) {
+  const t = await callClaude(promptRedaccion(candidato, ctx, evalEnt, calc, veredicto), 5000, 0.3);
+  const inf = pulirTextosInforme(t || {}, veredicto);
+  traducirDISCParaCliente(inf);
+  return inf;
+}
+
+async function generarInformeFinal(candidato, busqueda) {
+  const ctx = contextoInforme(candidato, busqueda);
+  let evalEnt = null;
+  if (ctx.hayEntrevista || ctx.hayReferencias) {
+    const r = await callClaude(promptClasificacion(candidato, ctx), 9000, 0);
+    const clasif = r && r.clasificacion ? r.clasificacion : r;
+    // las correcciones del consultor se vuelven a aplicar en cada regeneracion (su palabra manda)
+    const corrEnt = candidato.correcciones_entrevista ? safeParse(candidato.correcciones_entrevista) : null;
+    if (clasif && typeof clasif === 'object') evalEnt = recalcularEvalEnt(evaluarEntrevista(clasif, ctx.transcripcion, candidato.cv_texto, ctx.referencias, ctx.lectura), corrEnt);
+  }
   const calc = calcularScoreFinal(candidato, evalEnt, busqueda);
-  informe.scoreFinal = calc.scoreFinal;
-  informe.desglose = calc.desglose;
-  informe.veredictoFinal = veredictoPorScore(calc.scoreFinal, calc.desglose);
+  const veredicto = veredictoPorScore(calc.scoreFinal, calc.desglose);
+  const textos = await redactarInforme(candidato, ctx, evalEnt, calc, veredicto);
+  const informe = Object.assign({}, textos, {
+    evaluacionEntrevista: evalEnt, scoreFinal: calc.scoreFinal, desglose: calc.desglose, veredictoFinal: veredicto,
+    version: '2.8', textosGenerados: new Date().toISOString(), textosDesactualizados: false
+  });
+  coherenciaCierre(informe, candidato);
+  return informe;
+}
+
+// Reescribe solo los textos (sin volver a clasificar la entrevista): despues de que el consultor corrige items
+async function reescribirTextosInforme(candidato, busqueda) {
+  const informe = candidato.informe_final ? safeParse(candidato.informe_final) : null;
+  if (!informe || typeof informe !== 'object') throw new Error('Este candidato todavia no tiene informe');
+  const ctx = contextoInforme(candidato, busqueda);
+  const evalEnt = informe.evaluacionEntrevista || null;
+  if (evalEnt) recalcularEvalEnt(evalEnt, candidato.correcciones_entrevista ? safeParse(candidato.correcciones_entrevista) : null);
+  const calc = calcularScoreFinal(candidato, evalEnt, busqueda);
+  const veredicto = veredictoPorScore(calc.scoreFinal, calc.desglose);
+  const textos = await redactarInforme(candidato, ctx, evalEnt, calc, veredicto);
+  Object.assign(informe, textos, { scoreFinal: calc.scoreFinal, desglose: calc.desglose, veredictoFinal: veredicto, version: '2.8', textosGenerados: new Date().toISOString(), textosDesactualizados: false });
+  delete informe.cierreReescrito;
   coherenciaCierre(informe, candidato);
   return informe;
 }
@@ -2120,6 +2633,32 @@ Devolve SOLO este JSON:
 // ═══════════════════════════════════════
 // EXTRAER TEXTO DE ADJUNTOS
 // ═══════════════════════════════════════
+// v2.8.2: cada PDF se lee en un hilo aparte, desde cero. La libreria de PDF del server (pdf-parse) guarda estado
+// entre lecturas: con algunos PDF (por ejemplo los generados por ciertos sistemas) primero falla y despues devuelve
+// el texto del PDF ANTERIOR, o sea que un candidato podia quedar con el CV de otra persona. Aislado no pasa: si el
+// PDF no se puede leer, devuelve vacio y el CV lo transcribe la IA mirando el archivo. Ademas un PDF armado para
+// colgar el server se corta a los 30 segundos o si pide demasiada memoria.
+const { Worker } = require('worker_threads');
+let RUTA_PDF_PARSE = null;
+try { RUTA_PDF_PARSE = require.resolve('pdf-parse/lib/pdf-parse.js'); } catch (e) {}
+const CODIGO_LECTOR_PDF = "const { parentPort, workerData } = require('worker_threads');" +
+  "require(workerData.mod)(Buffer.from(workerData.buf)).then(d => parentPort.postMessage({ ok: true, text: d.text || '', numpages: d.numpages || 1 }))" +
+  ".catch(e => parentPort.postMessage({ ok: false, error: String((e && e.message) || e) }));";
+function leerPDFAislado(buffer) {
+  if (!RUTA_PDF_PARSE) return pdfParse(buffer);
+  return new Promise((resolve, reject) => {
+    let w;
+    try { w = new Worker(CODIGO_LECTOR_PDF, { eval: true, workerData: { buf: buffer, mod: RUTA_PDF_PARSE }, resourceLimits: { maxOldGenerationSizeMb: 256 }, stdout: true, stderr: true }); }
+    catch (e) { return pdfParse(buffer).then(resolve, reject); }
+    let fin = false;
+    const terminar = (err, val) => { if (fin) return; fin = true; clearTimeout(t); w.terminate().catch(() => {}); err ? reject(err) : resolve(val); };
+    const t = setTimeout(() => terminar(new Error('el PDF tardo demasiado en leerse')), 30000);
+    w.once('message', m => m && m.ok ? terminar(null, m) : terminar(new Error((m && m.error) || 'no se pudo leer el PDF')));
+    w.once('error', e => terminar(e));
+    w.once('exit', code => terminar(new Error('el lector de PDF se corto (' + code + ')')));
+  });
+}
+
 async function extraerTexto(attachment) {
   const buffer = Buffer.isBuffer(attachment.content)
     ? attachment.content
@@ -2127,7 +2666,7 @@ async function extraerTexto(attachment) {
   const filename = (attachment.filename || '').toLowerCase();
   try {
     if (filename.endsWith('.pdf')) {
-      const data = await pdfParse(buffer);
+      const data = await leerPDFAislado(buffer);
       attachment._paginas = data.numpages || 1;
       return data.text || '';
     }
@@ -2287,24 +2826,35 @@ function guardarCandidato(busqueda_id, email_origen, cvTexto, analisis, pdfAlert
 // ═══════════════════════════════════════
 let colaActiva = false;
 // Error de la IA explicado en castellano (se ve en la carga multiple)
+// v2.8.2: se reconoce el error por el codigo de la API (antes " 5xx" en cualquier mensaje, como "500 caracteres", se leia como falla de la IA)
 function mensajeErrorIA(e) {
   const m = String((e && e.message) || e || '');
   if (/credit balance|billing/i.test(m)) return 'La cuenta de la IA no tiene credito (Anthropic → Billing)';
-  if (/ 401|authentication/i.test(m)) return 'La clave de la IA es invalida (ANTHROPIC_API_KEY en Railway)';
-  if (/ 429|rate_limit/i.test(m)) return 'La IA llego al limite de uso por minuto: toca "Reintentar" en unos minutos';
-  if (/ 529|overloaded/i.test(m)) return 'La IA estaba saturada: toca "Reintentar" en unos minutos';
-  if (/ 5\d\d|Sin conexion/i.test(m)) return 'Falla temporal de la IA: toca "Reintentar"';
-  if (/cortada|formato esperado/i.test(m)) return 'La respuesta de la IA vino incompleta: toca "Reintentar"';
-  if (/ 413|too large|request_too_large/i.test(m)) return 'El archivo es demasiado grande para la IA';
+  if (/API error 401|authentication_error|invalid x-api-key/i.test(m)) return 'La clave de la IA es invalida (ANTHROPIC_API_KEY en Railway)';
+  if (/API error 429|rate_limit/i.test(m)) return 'La IA llego al limite de uso por minuto: proba de nuevo en unos minutos';
+  if (/API error 529|overloaded/i.test(m)) return 'La IA estaba saturada: proba de nuevo en unos minutos';
+  if (/API error 5\d\d|Sin conexion/i.test(m)) return 'Falla temporal de la IA: proba de nuevo en unos minutos';
+  if (/vino cortada|formato esperado/i.test(m)) return 'La respuesta de la IA vino incompleta: proba de nuevo';
+  if (/API error 413|request_too_large/i.test(m)) return 'El archivo es demasiado grande para la IA';
+  if (/prompt is too long|too many tokens/i.test(m)) return 'El texto es demasiado largo para la IA (CV o transcripcion muy extensos)';
+  if (/^Claude API error/i.test(m)) return 'La IA devolvio un error: ' + m.replace(/^Claude API error\s*/i, '').substring(0, 160);
   return m.substring(0, 200);
 }
+// Error en una ruta: al panel le llega el motivo en castellano; el detalle tecnico queda en los logs de Railway
+function responderError(res, err) {
+  console.error('❌ ' + ((err && err.stack) || err));
+  if (!res.headersSent) res.status(500).json({ error: mensajeErrorIA(err) });
+}
+// Fallas pasajeras de la IA (saturada, limite por minuto, corte de red): la cola las reintenta sola mas tarde
+function esErrorPasajero(e) { return /API error (408|409|429|5\d\d)|overloaded|rate_limit|Sin conexion/i.test(String((e && e.message) || e || '')); }
+const ESPERAS_COLA = [2 * 60000, 10 * 60000, 30 * 60000];
 
 async function procesarCola() {
   if (colaActiva) return;
   colaActiva = true;
   try {
     while (true) {
-      const item = db.prepare("SELECT * FROM cola WHERE estado = 'pendiente' ORDER BY id ASC LIMIT 1").get();
+      const item = db.prepare("SELECT * FROM cola WHERE estado = 'pendiente' AND (reintentar_despues IS NULL OR reintentar_despues <= ?) ORDER BY id ASC LIMIT 1").get(Date.now());
       if (!item) break;
       db.prepare("UPDATE cola SET estado = 'procesando' WHERE id = ?").run(item.id);
       try {
@@ -2313,16 +2863,35 @@ async function procesarCola() {
           db.prepare("UPDATE cola SET estado = 'error', error = 'Busqueda no encontrada' WHERE id = ?").run(item.id);
           continue;
         }
+        if (!item.cv_texto) {
+          db.prepare("UPDATE cola SET estado = 'error', error = 'El texto del CV ya no esta (volve a subir el archivo)' WHERE id = ?").run(item.id);
+          continue;
+        }
+        // el mismo CV ya se analizo para esta busqueda (por ejemplo, llego por mail y tambien se subio a mano): no se duplica
+        const ya = db.prepare('SELECT id FROM candidatos WHERE busqueda_id = ? AND cv_hash = ?').get(item.busqueda_id, item.cv_hash);
+        if (ya) {
+          db.prepare("UPDATE cola SET estado = 'listo', candidato_id = ?, error = NULL, cv_texto = NULL WHERE id = ?").run(ya.id, item.id);
+          continue;
+        }
         const pdfAl = item.pdf_alertas ? safeParse(item.pdf_alertas) : null;
         const analisis = await analizarCV(item.cv_texto, busqueda, Object.assign({ pdfAlertas: pdfAl }, archivoOriginal(item.cv_texto, item.cv_hash)));
-        const candId = guardarCandidato(item.busqueda_id, null, item.cv_texto, analisis, pdfAl);
-        db.prepare("UPDATE cola SET estado = 'listo', candidato_id = ? WHERE id = ?").run(candId, item.id);
-        // carga manual: ya no se manda el mail de aviso (era ruido; el resultado esta en el panel)
+        const candId = guardarCandidato(item.busqueda_id, item.email_origen || null, item.cv_texto, analisis, pdfAl);
+        db.prepare("UPDATE cola SET estado = 'listo', candidato_id = ?, error = NULL, cv_texto = NULL WHERE id = ?").run(candId, item.id);
         console.log('✅ Cola: ' + (analisis.nombre || item.nombre_archivo) + ' (' + analisis.score + '/100)');
+        // carga manual: sin mail de aviso (el resultado esta en el panel). Si llego por mail, se avisa como siempre.
+        if (item.email_origen) {
+          try { await enviarInforme(analisis, busqueda); } catch (e2) { console.log('   ⚠️  No se pudo mandar el aviso por mail: ' + e2.message); }
+        }
       } catch (e) {
-        db.prepare("UPDATE cola SET estado = 'error', error = ? WHERE id = ?")
-          .run(mensajeErrorIA(e).substring(0, 300), item.id);
-        console.log('❌ Cola error en ' + item.nombre_archivo + ': ' + e.message);
+        const intentos = (item.intentos || 0) + 1;
+        const espera = esErrorPasajero(e) ? ESPERAS_COLA[intentos - 1] : null;
+        if (espera) {
+          db.prepare("UPDATE cola SET estado = 'pendiente', intentos = ?, reintentar_despues = ?, error = ? WHERE id = ?")
+            .run(intentos, Date.now() + espera, (mensajeErrorIA(e) + ' · se reintenta solo en ' + Math.round(espera / 60000) + ' min').substring(0, 300), item.id);
+        } else {
+          db.prepare("UPDATE cola SET estado = 'error', intentos = ?, error = ? WHERE id = ?").run(intentos, mensajeErrorIA(e).substring(0, 300), item.id);
+        }
+        console.log('❌ Cola error en ' + item.nombre_archivo + ': ' + e.message + (espera ? ' (reintento automatico)' : ''));
       }
     }
   } finally {
@@ -2342,127 +2911,199 @@ function detectarCodigo(subject) {
   return m ? m[0] : null;
 }
 
+// v2.8.2: lector de mails mas robusto
+// - Un mail sin Message-ID ya no se reprocesa en cada vuelta: se le arma un identificador estable.
+// - Primero se miran solo los encabezados y se baja completo SOLO lo nuevo (antes se descargaban, con adjuntos,
+//   todos los mails no leidos de la casilla cada 2 minutos).
+// - Ya no depende de que el mail siga "no leido": si lo abriste en Gmail antes de que pase el agente, igual se procesa.
+//   Se miran los ultimos IMAP_SINCE_DAYS dias (7 por defecto); lo leido de antes de esta version no se toca.
+// - El analisis con IA se hace con la casilla ya cerrada (antes la conexion quedaba abierta mientras la IA trabajaba).
+// - Si la IA falla, el CV no se pierde: queda en la cola del agente y se reintenta solo.
+// - El mismo CV que llega dos veces para la misma busqueda no se duplica.
+const REMITENTE_AUTOMATICO = /(no-?reply|mailer-daemon|postmaster|notifications?@|@netlify\.com|@formsubmit|@linkedin\.com)/i;
+const IMAP_DIAS = Math.min(60, Math.max(1, parseInt(process.env.IMAP_SINCE_DAYS || '7', 10) || 7));
+const MAX_MAILS_POR_VUELTA = 15;
+function idMensaje(msg) {
+  const env = msg.envelope || {};
+  if (env.messageId) return String(env.messageId);
+  const from = (env.from || []).map(f => f && f.address).join(',');
+  return 'sin-id:' + crypto.createHash('sha1').update([msg.uid, env.date ? new Date(env.date).toISOString() : '', from, env.subject || ''].join('|')).digest('hex');
+}
+function inicioLectorMails() {
+  const r = db.prepare("SELECT valor FROM meta WHERE clave = 'imap_inicio'").get();
+  if (r && Number(r.valor)) return Number(r.valor);
+  const ahora = Date.now();
+  db.prepare("INSERT OR REPLACE INTO meta (clave, valor) VALUES ('imap_inicio', ?)").run(String(ahora));
+  return ahora;
+}
+function marcarMail(messageId, from, subject) {
+  db.prepare('INSERT OR IGNORE INTO emails_procesados (message_id, from_email, subject) VALUES (?, ?, ?)').run(messageId, from, subject);
+}
+
 async function revisarEmails() {
   if (monitorActivo) return;
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;   // sin casilla configurada no hay nada que leer
   monitorActivo = true;
+  const nuevos = [];
   let client;
   try {
-    client = new ImapFlow(IMAP_CONFIG);
-    await client.connect();
-    const lock = await client.getMailboxLock('INBOX');
     try {
-      const messages = client.fetch({ seen: false }, { envelope: true, source: true, uid: true });
-      for await (const msg of messages) {
-        const messageId = msg.envelope.messageId;
-        const exists = db.prepare('SELECT id FROM emails_procesados WHERE message_id = ?').get(messageId);
-        if (exists) continue;
-
-        const parsed = await simpleParser(msg.source);
-        const from = parsed.from && parsed.from.value && parsed.from.value[0] ? parsed.from.value[0].address : 'desconocido';
-        const subject = parsed.subject || 'Sin asunto';
-        console.log('\n📬 Nuevo email de: ' + from + ' | Asunto: ' + subject);
-
-        if (/(no-?reply|mailer-daemon|postmaster|notifications?@|@netlify\.com|@formsubmit|@linkedin\.com)/i.test(from)) {
-          console.log('   ⏭️  Remitente automatico (' + from + '), ignorando');
-          db.prepare('INSERT OR IGNORE INTO emails_procesados (message_id, from_email, subject) VALUES (?, ?, ?)').run(messageId, from, subject);
-          continue;
+      const inicio = inicioLectorMails();
+      const desde = new Date(Date.now() - IMAP_DIAS * 24 * 3600 * 1000);
+      client = new ImapFlow(IMAP_CONFIG);
+      await client.connect();
+      const lock = await client.getMailboxLock('INBOX');
+      try {
+        // 1) solo los encabezados (liviano)
+        const vistos = [];
+        for await (const msg of client.fetch({ since: desde }, { envelope: true, uid: true, flags: true, internalDate: true })) {
+          const leido = !!(msg.flags && typeof msg.flags.has === 'function' && msg.flags.has('\\Seen'));
+          const fecha = msg.internalDate ? new Date(msg.internalDate).getTime() : Date.now();
+          if (leido && fecha < inicio) continue;   // leido y anterior a esta version: ya lo habia visto la version anterior
+          vistos.push({ uid: msg.uid, id: idMensaje(msg), envelope: msg.envelope || {} });
         }
-
-        let attachments = (parsed.attachments || []).filter(function (a) {
-          const name = (a.filename || '').toLowerCase();
-          return /\.(pdf|docx?|odt|rtf)$/.test(name);
-        });
-        // si no hay PDF ni Word, una foto del CV (las imagenes chicas suelen ser logos de la firma)
-        if (!attachments.length) attachments = (parsed.attachments || []).filter(a => /\.(jpe?g|png|webp)$/i.test(a.filename || '') && (a.size || (a.content && a.content.length) || 0) > 40000).slice(0, 1);
-
-        // marcar procesado siempre
-        function marcar() {
-          db.prepare('INSERT OR IGNORE INTO emails_procesados (message_id, from_email, subject) VALUES (?, ?, ?)')
-            .run(messageId, from, subject);
-        }
-
-        if (attachments.length === 0) {
-          console.log('   ⏭️  Sin CV adjunto, ignorando');
-          marcar();
-          continue;
-        }
-
-        // 1) intentar por codigo en el asunto
-        let busqueda = null;
-        const codigo = detectarCodigo(subject);
-        if (codigo) {
-          busqueda = db.prepare("SELECT * FROM busquedas WHERE codigo = ? AND estado = 'activa'").get(codigo);
-          if (busqueda) console.log('   🏷️  Codigo detectado: ' + codigo + ' -> ' + busqueda.puesto);
-        }
-
-        // 2) si no hay codigo: si hay UNA sola busqueda activa, usar esa
-        if (!busqueda) {
-          const activas = db.prepare("SELECT * FROM busquedas WHERE estado = 'activa' ORDER BY created_at DESC").all();
-          if (activas.length === 1) {
-            busqueda = activas[0];
-            console.log('   ℹ️  Sin codigo, unica busqueda activa -> ' + busqueda.puesto);
-          } else if (activas.length === 0) {
-            console.log('   ⚠️  No hay busqueda activa, guardando CV sin asignar');
-          } else {
-            console.log('   ⚠️  Varias busquedas activas y sin codigo -> CV sin asignar (revisar en panel)');
+        // 2) se baja completo solo lo nuevo
+        for (const m of vistos) {
+          if (nuevos.length >= MAX_MAILS_POR_VUELTA) break;   // el resto, en la proxima vuelta
+          if (db.prepare('SELECT 1 FROM emails_procesados WHERE message_id = ?').get(m.id)) continue;
+          const from = ((m.envelope.from || [])[0] || {}).address || 'desconocido';
+          if (REMITENTE_AUTOMATICO.test(from)) {
+            console.log('\n📬 Nuevo email de: ' + from + ' | Asunto: ' + (m.envelope.subject || 'Sin asunto'));
+            console.log('   ⏭️  Remitente automatico (' + from + '), ignorando');
+            marcarMail(m.id, from, m.envelope.subject || 'Sin asunto');
+            continue;
           }
+          const completo = await client.fetchOne(String(m.uid), { source: true }, { uid: true });
+          if (completo && completo.source) nuevos.push({ id: m.id, source: completo.source });
         }
-
-        try {
-          let cvTexto = '';
-          for (const att of attachments) {
-            cvTexto += '\n' + await extraerTexto(att);
-          }
-          const b64 = a => Buffer.isBuffer(a.content) ? a.content.toString('base64') : String(a.content || '');
-          const mimeDe = a => (a.filename || '').toLowerCase().endsWith('.pdf') ? 'application/pdf' : (a.contentType || 'application/octet-stream');
-          let pdfAlertas = null;
-          // PDF escaneado, foto, fuente rota o CV con partes en imagen → lo transcribe la IA (antes estos CV se perdian o se leian a medias)
-          const util = cvTexto.replace(/\s+/g, '').length;
-          const pdfA = attachments.find(a => (a.filename || '').toLowerCase().endsWith('.pdf'));
-          const motivo = util < 80 ? 'escaneado' : textoIlegible(cvTexto) ? 'fuente rota' : (pdfA && attachments.length === 1 && util / (pdfA._paginas || 1) < 350) ? 'parte en imagen' : null;
-          if (motivo) {
-            const escaneable = attachments.find(a => /\.(pdf|jpe?g|png|webp)$/i.test(a.filename || ''));
-            if (escaneable && (escaneable.size || (escaneable.content && escaneable.content.length) || 0) < 22 * 1024 * 1024) {
-              try {
-                const t = await transcribirArchivo(b64(escaneable), mimeDe(escaneable));
-                const tu = t.replace(/\s+/g, '').length;
-                if (tu >= 80 && (motivo !== 'parte en imagen' || tu > util * 1.4)) { cvTexto = t; pdfAlertas = { escaneado: true, motivoTranscripcion: /\.pdf$/i.test(escaneable.filename || '') ? motivo : 'foto' }; console.log('   🔎 CV transcripto por la IA (' + motivo + ')'); }
-              } catch (e) { console.log('   ⚠️  No se pudo transcribir: ' + e.message); }
-            }
-            // un texto ilegible no se analiza: daria un resultado sin sentido
-            if (motivo === 'fuente rota' && !pdfAlertas) cvTexto = '';
-          }
-          if (cvTexto.replace(/\s+/g, '').length < 80) { console.log('   ⚠️  No se pudo extraer texto del CV'); marcar(); continue; }
-          // el archivo original queda guardado (para "Ver CV original" y para que los reanalisis miren el PDF)
-          const original = attachments.find(a => (a.filename || '').toLowerCase().endsWith('.pdf')) || attachments[0];
-          if (original) guardarArchivoCV(cvTexto, b64(original), original.filename, mimeDe(original));
-
-          if (busqueda) {
-            const pdfAdj = attachments.find(a => (a.filename || '').toLowerCase().endsWith('.pdf'));
-            const analisis = await analizarCV(cvTexto, busqueda, Object.assign({ pdfAlertas }, pdfAdj ? { pdfBase64: b64(pdfAdj), pdfMime: 'application/pdf' } : {}));
-            guardarCandidato(busqueda.id, from, cvTexto, analisis, pdfAlertas);
-            await enviarInforme(analisis, busqueda);
-          } else {
-            // guardar sin asignar para que Hernan lo ubique en el panel
-            db.prepare(`INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, cv_hash, pdf_alertas, estado_proceso)
-                        VALUES (NULL, ?, ?, ?, ?, ?, 'Sin asignar')`)
-              .run((from.split('@')[0] || 'Candidato'), from, cvTexto.substring(0, MAX_CV), hashCV(cvTexto), pdfAlertas ? JSON.stringify(pdfAlertas) : null);
-            console.log('   📥 CV guardado sin asignar');
-          }
-          marcar();
-        } catch (e) {
-          console.log('   ❌ Error procesando CV: ' + e.message);
-          marcar();
-        }
+      } finally {
+        lock.release();
       }
+    } catch (err) {
+      console.log('❌ Error monitor IMAP: ' + err.message);
     } finally {
-      lock.release();
+      if (client) { try { await client.logout(); } catch (e) {} }
     }
-  } catch (err) {
-    console.log('❌ Error monitor IMAP: ' + err.message);
+    // 3) con la casilla ya cerrada, se procesa cada mail nuevo
+    for (const m of nuevos) {
+      try { await procesarMail(m.id, m.source); }
+      catch (e) {
+        // un mail que no se puede ni leer (mal armado) se marca igual: si no, se reintentaria cada 2 minutos para siempre
+        console.log('   ❌ Error procesando el mail: ' + e.message);
+        try { marcarMail(m.id, 'desconocido', 'No se pudo leer: ' + String(e.message).substring(0, 150)); } catch (e2) {}
+      }
+    }
   } finally {
-    if (client) { try { await client.logout(); } catch (e) {} }
     monitorActivo = false;
+  }
+}
+
+async function procesarMail(messageId, source) {
+  const parsed = await simpleParser(source);
+  const from = parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address ? parsed.from.value[0].address : 'desconocido';
+  const subject = parsed.subject || 'Sin asunto';
+  const marcar = () => marcarMail(messageId, from, subject);
+  console.log('\n📬 Nuevo email de: ' + from + ' | Asunto: ' + subject);
+
+  if (REMITENTE_AUTOMATICO.test(from)) {
+    console.log('   ⏭️  Remitente automatico (' + from + '), ignorando');
+    return marcar();
+  }
+
+  let attachments = (parsed.attachments || []).filter(function (a) {
+    const name = (a.filename || '').toLowerCase();
+    return /\.(pdf|docx?|odt|rtf)$/.test(name);
+  });
+  // si no hay PDF ni Word, una foto del CV (las imagenes chicas suelen ser logos de la firma)
+  if (!attachments.length) attachments = (parsed.attachments || []).filter(a => /\.(jpe?g|png|webp)$/i.test(a.filename || '') && (a.size || (a.content && a.content.length) || 0) > 40000).slice(0, 1);
+
+  if (attachments.length === 0) {
+    console.log('   ⏭️  Sin CV adjunto, ignorando');
+    return marcar();
+  }
+
+  // 1) intentar por codigo en el asunto
+  let busqueda = null;
+  const codigo = detectarCodigo(subject);
+  if (codigo) {
+    busqueda = db.prepare("SELECT * FROM busquedas WHERE codigo = ? AND estado = 'activa'").get(codigo);
+    if (busqueda) console.log('   🏷️  Codigo detectado: ' + codigo + ' -> ' + busqueda.puesto);
+  }
+
+  // 2) si no hay codigo: si hay UNA sola busqueda activa, usar esa
+  if (!busqueda) {
+    const activas = db.prepare("SELECT * FROM busquedas WHERE estado = 'activa' ORDER BY created_at DESC").all();
+    if (activas.length === 1) {
+      busqueda = activas[0];
+      console.log('   ℹ️  Sin codigo, unica busqueda activa -> ' + busqueda.puesto);
+    } else if (activas.length === 0) {
+      console.log('   ⚠️  No hay busqueda activa, guardando CV sin asignar');
+    } else {
+      console.log('   ⚠️  Varias busquedas activas y sin codigo -> CV sin asignar (revisar en panel)');
+    }
+  }
+
+  try {
+    let cvTexto = '';
+    for (const att of attachments) {
+      cvTexto += '\n' + await extraerTexto(att);
+    }
+    const b64 = a => Buffer.isBuffer(a.content) ? a.content.toString('base64') : String(a.content || '');
+    const mimeDe = a => (a.filename || '').toLowerCase().endsWith('.pdf') ? 'application/pdf' : (a.contentType || 'application/octet-stream');
+    let pdfAlertas = null;
+    // PDF escaneado, foto, fuente rota o CV con partes en imagen → lo transcribe la IA (antes estos CV se perdian o se leian a medias)
+    const util = cvTexto.replace(/\s+/g, '').length;
+    const pdfA = attachments.find(a => (a.filename || '').toLowerCase().endsWith('.pdf'));
+    const motivo = util < 80 ? 'escaneado' : textoIlegible(cvTexto) ? 'fuente rota' : (pdfA && attachments.length === 1 && util / (pdfA._paginas || 1) < 350) ? 'parte en imagen' : null;
+    if (motivo) {
+      const escaneable = attachments.find(a => /\.(pdf|jpe?g|png|webp)$/i.test(a.filename || ''));
+      if (escaneable && (escaneable.size || (escaneable.content && escaneable.content.length) || 0) < 22 * 1024 * 1024) {
+        try {
+          const t = await transcribirArchivo(b64(escaneable), mimeDe(escaneable));
+          const tu = t.replace(/\s+/g, '').length;
+          if (tu >= 80 && (motivo !== 'parte en imagen' || tu > util * 1.4)) { cvTexto = t; pdfAlertas = { escaneado: true, motivoTranscripcion: /\.pdf$/i.test(escaneable.filename || '') ? motivo : 'foto' }; console.log('   🔎 CV transcripto por la IA (' + motivo + ')'); }
+        } catch (e) { console.log('   ⚠️  No se pudo transcribir: ' + e.message); }
+      }
+      // un texto ilegible no se analiza: daria un resultado sin sentido
+      if (motivo === 'fuente rota' && !pdfAlertas) cvTexto = '';
+    }
+    if (cvTexto.replace(/\s+/g, '').length < 80) { console.log('   ⚠️  No se pudo extraer texto del CV'); return marcar(); }
+    // el archivo original queda guardado (para "Ver CV original" y para que los reanalisis miren el PDF)
+    const original = attachments.find(a => (a.filename || '').toLowerCase().endsWith('.pdf')) || attachments[0];
+    if (original) guardarArchivoCV(cvTexto, b64(original), original.filename, mimeDe(original));
+    const h = hashCV(cvTexto);
+
+    if (busqueda) {
+      const ya = db.prepare('SELECT id FROM candidatos WHERE busqueda_id = ? AND cv_hash = ?').get(busqueda.id, h);
+      if (ya) { console.log('   ⏭️  Ese CV ya estaba cargado en esta busqueda (candidato ' + ya.id + ')'); return marcar(); }
+      const pdfAdj = attachments.find(a => (a.filename || '').toLowerCase().endsWith('.pdf'));
+      let analisis;
+      try {
+        analisis = await analizarCV(cvTexto, busqueda, Object.assign({ pdfAlertas }, pdfAdj ? { pdfBase64: b64(pdfAdj), pdfMime: 'application/pdf' } : {}));
+      } catch (e) {
+        // la IA fallo (sin credito, saturada, sin conexion): antes el CV se perdia. Ahora queda en la cola y se reintenta solo.
+        db.prepare("INSERT INTO cola (busqueda_id, nombre_archivo, cv_texto, cv_hash, estado, pdf_alertas, email_origen, error, intentos, reintentar_despues) VALUES (?, ?, ?, ?, 'pendiente', ?, ?, ?, 0, ?)")
+          .run(busqueda.id, (original && original.filename) || ('CV de ' + from), cvTexto.substring(0, MAX_CV), h, pdfAlertas ? JSON.stringify(pdfAlertas) : null, from,
+            ('Llego por mail y la IA no lo pudo analizar en ese momento: ' + mensajeErrorIA(e)).substring(0, 300), Date.now() + ESPERAS_COLA[0]);
+        console.log('   ⏳ La IA fallo (' + e.message.substring(0, 120) + '): el CV queda en la cola y se reintenta solo');
+        return marcar();
+      }
+      guardarCandidato(busqueda.id, from, cvTexto, analisis, pdfAlertas);
+      marcar();
+      try { await enviarInforme(analisis, busqueda); } catch (e) { console.log('   ⚠️  No se pudo mandar el aviso por mail: ' + e.message); }
+    } else {
+      // guardar sin asignar para que Hernan lo ubique en el panel (si no estaba ya)
+      const ya = db.prepare('SELECT id FROM candidatos WHERE busqueda_id IS NULL AND cv_hash = ?').get(h);
+      if (ya) { console.log('   ⏭️  Ese CV ya estaba guardado sin asignar (candidato ' + ya.id + ')'); return marcar(); }
+      db.prepare(`INSERT INTO candidatos (busqueda_id, nombre, email_origen, cv_texto, cv_hash, pdf_alertas, estado_proceso)
+                  VALUES (NULL, ?, ?, ?, ?, ?, 'Sin asignar')`)
+        .run((from.split('@')[0] || 'Candidato'), from, cvTexto.substring(0, MAX_CV), h, pdfAlertas ? JSON.stringify(pdfAlertas) : null);
+      console.log('   📥 CV guardado sin asignar');
+      marcar();
+    }
+  } catch (e) {
+    console.log('   ❌ Error procesando CV: ' + e.message);
+    marcar();
   }
 }
 
@@ -2479,14 +3120,19 @@ function generarCodigo(puesto) {
     codigo = 'APT-' + base + n;
     intentos++;
   } while (db.prepare('SELECT id FROM busquedas WHERE codigo = ?').get(codigo) && intentos < 20);
+  // muy improbable: los 20 intentos ya estaban usados → codigo con marca de tiempo (nunca repetido)
+  if (db.prepare('SELECT id FROM busquedas WHERE codigo = ?').get(codigo)) codigo = 'APT-' + base + Date.now().toString(36).toUpperCase().slice(-6);
   return codigo;
 }
 
 // Crear busqueda
 app.post('/api/busquedas', (req, res) => {
   const b = req.body || {};
-  if (!b.empresa || !b.puesto) return res.status(400).json({ error: 'Faltan empresa y puesto' });
-  const codigo = b.codigo || generarCodigo(b.puesto);
+  if (!String(b.empresa || '').trim() || !String(b.puesto || '').trim()) return res.status(400).json({ error: 'Faltan empresa y puesto' });
+  // v2.8.2: un codigo repetido daba un error 500 de la base; ahora se avisa claro
+  const codigo = b.codigo ? String(b.codigo).trim().toUpperCase() : generarCodigo(b.puesto);
+  if (b.codigo && !/^APT-[A-Z0-9]{2,12}$/.test(codigo)) return res.status(400).json({ error: 'El codigo tiene que ser APT- seguido de 2 a 12 letras o numeros (ej. APT-VENT123)' });
+  if (db.prepare('SELECT id FROM busquedas WHERE codigo = ?').get(codigo)) return res.status(409).json({ error: 'Ya existe una busqueda con el codigo ' + codigo });
   const campos = ['codigo','empresa','rubro_empresa','contacto_nombre','contacto_email','puesto','area','reporta_a',
     'ubicacion','modalidad','contratacion','jornada','salario_desde','salario_hasta','moneda','fecha_objetivo',
     'posiciones','formacion_minima','experiencia_minima','hard_skills','idiomas','certificaciones','disponibilidad',
@@ -2543,7 +3189,7 @@ app.get('/api/busquedas/:id/perfil', async (req, res) => {
       .map(c => safeParse(c.cv_lectura)).filter(l => l && l.version === 'v4');
     res.json(Object.assign({}, perfil, { pesosTipo: PESOS_TIPO_PUESTO[b.tipo_puesto] || PESOS_TIPO_PUESTO.general, tipoPuesto: b.tipo_puesto || 'general',
       candidatosConOtroPerfil: candidatos.filter(l => l.perfilHash && l.perfilHash !== perfil.hash).length }));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { responderError(res, err); }
 });
 
 // Hernan ajusta criticidades / plus / perfil DISC → se guardan y se recalculan los scores SIN IA
@@ -2605,6 +3251,8 @@ function recalcularBusqueda(bid) {
     if (c.informe_final && (r || discObj || pa2)) {
       const cand = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(c.id);
       const informe = safeParse(cand.informe_final);
+      // v2.7.2: la entrevista tambien se recalcula con las tablas vigentes y las correcciones del consultor
+      if (informe.evaluacionEntrevista) recalcularEvalEnt(informe.evaluacionEntrevista, cand.correcciones_entrevista ? safeParse(cand.correcciones_entrevista) : null);
       const calc = calcularScoreFinal(cand, informe.evaluacionEntrevista || null, b);
       informe.scoreFinal = calc.scoreFinal; informe.desglose = calc.desglose;
       informe.veredictoFinal = veredictoPorScore(calc.scoreFinal, calc.desglose);
@@ -2616,16 +3264,31 @@ function recalcularBusqueda(bid) {
 }
 
 // Listar candidatos (opcional por busqueda)
+// v2.8.2: la lista va liviana. Antes mandaba el CV completo, la entrevista y el informe de TODOS los candidatos cada vez
+// que se abria la pantalla (con cientos de candidatos tardaba y pesaba decenas de MB). La ficha trae todo; ?completo=1 tambien.
+function candidatoLiviano(r) {
+  const inf = r.informe_final ? safeParse(r.informe_final) : null;
+  const integ = r.integridad ? safeParse(r.integridad) : null;
+  const seg = r.seguimiento ? safeParse(r.seguimiento) : null;
+  return {
+    id: r.id, busqueda_id: r.busqueda_id, nombre: r.nombre, email_origen: r.email_origen,
+    score: r.score, score_final: r.score_final, recomendacion: r.recomendacion, estado_proceso: r.estado_proceso,
+    informe_estado: r.informe_estado, created_at: r.created_at, cv_archivo_nombre: r.cv_archivo_nombre, ubicacion: r.ubicacion,
+    seguimiento: seg && typeof seg === 'object' ? seg : {},
+    integridad: integ && typeof integ === 'object' ? { nivel: integ.nivel || null } : null,
+    informe_final: inf && typeof inf === 'object' ? { veredictoFinal: inf.veredictoFinal || null, scoreFinal: inf.scoreFinal != null ? inf.scoreFinal : null } : null,
+    liviano: true
+  };
+}
+const COLS_LISTA = 'id, busqueda_id, nombre, email_origen, score, score_final, recomendacion, estado_proceso, informe_estado, created_at, ubicacion, seguimiento, integridad, informe_final, cv_hash';
 app.get('/api/candidatos', (req, res) => {
   const { busqueda_id } = req.query;
-  let rows;
-  if (busqueda_id) {
-    rows = db.prepare('SELECT candidatos.*, (SELECT nombre FROM cv_archivos WHERE cv_hash = candidatos.cv_hash) AS cv_archivo_nombre FROM candidatos WHERE busqueda_id = ? ORDER BY COALESCE(score_final, score, 0) DESC').all(busqueda_id);
-  } else {
-    rows = db.prepare('SELECT candidatos.*, (SELECT nombre FROM cv_archivos WHERE cv_hash = candidatos.cv_hash) AS cv_archivo_nombre FROM candidatos ORDER BY created_at DESC').all();
-  }
-  rows = rows.map(parseCand);
-  res.json(rows);
+  const completo = req.query.completo === '1';
+  const cols = (completo ? 'candidatos.*' : COLS_LISTA) + ', (SELECT nombre FROM cv_archivos WHERE cv_hash = candidatos.cv_hash) AS cv_archivo_nombre';
+  const rows = busqueda_id
+    ? db.prepare('SELECT ' + cols + ' FROM candidatos WHERE busqueda_id = ? ORDER BY COALESCE(score_final, score, 0) DESC').all(busqueda_id)
+    : db.prepare('SELECT ' + cols + ' FROM candidatos ORDER BY created_at DESC').all();
+  res.json(rows.map(completo ? parseCand : candidatoLiviano));
 });
 
 app.get('/api/candidatos/:id', (req, res) => {
@@ -2634,30 +3297,83 @@ app.get('/api/candidatos/:id', (req, res) => {
   res.json(parseCand(row));
 });
 
-// Servir el archivo original del CV (para abrir en solo lectura en el panel)
-app.get('/api/candidatos/:id/archivo', (req, res) => {
-  const c = db.prepare('SELECT cv_hash FROM candidatos WHERE id = ?').get(req.params.id);
-  if (!c || !c.cv_hash) return res.status(404).json({ error: 'Sin archivo' });
-  const f = db.prepare('SELECT nombre, mime, base64 FROM cv_archivos WHERE cv_hash = ?').get(c.cv_hash);
-  if (!f || !f.base64) return res.status(404).json({ error: 'Sin archivo' });
+// ───────── Archivo original del CV ─────────
+// v2.8.2 (seguridad): antes se devolvia con el tipo que traia el adjunto del mail. Un "CV" armado como pagina web
+// (.html/.svg con otro nombre) se abria como pagina en el dominio del server y podia ejecutar codigo. Ahora el tipo
+// se decide mirando el contenido real del archivo: PDF e imagenes se ven en el navegador; Word, LibreOffice y el resto
+// se descargan. Nunca se ejecuta nada.
+const MIME_DESCARGA = {
+  doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  odt: 'application/vnd.oasis.opendocument.text', rtf: 'application/rtf', txt: 'text/plain; charset=utf-8'
+};
+function tipoArchivoSeguro(buf, nombre) {
+  const ext = (String(nombre || '').toLowerCase().match(/\.([a-z0-9]+)$/) || [])[1] || '';
+  const cab = buf.subarray(0, 16), lat = cab.toString('latin1');
+  if (buf.subarray(0, 1024).toString('latin1').indexOf('%PDF-') >= 0) return { tipo: 'application/pdf', inline: true, ext: 'pdf' };
+  if (cab[0] === 0xFF && cab[1] === 0xD8 && cab[2] === 0xFF) return { tipo: 'image/jpeg', inline: true, ext: 'jpg' };
+  if (lat.startsWith('\x89PNG\r\n\x1a\n')) return { tipo: 'image/png', inline: true, ext: 'png' };
+  if (lat.startsWith('RIFF') && lat.substring(8, 12) === 'WEBP') return { tipo: 'image/webp', inline: true, ext: 'webp' };
+  if (/^GIF8[79]a/.test(lat)) return { tipo: 'image/gif', inline: true, ext: 'gif' };
+  if (MIME_DESCARGA[ext]) return { tipo: MIME_DESCARGA[ext], inline: false, ext };
+  return { tipo: 'application/octet-stream', inline: false, ext: 'bin' };
+}
+function nombreDescarga(nombre, ext) {
+  let n = String(nombre || 'cv').replace(/[\r\n"\\\/]/g, ' ').trim() || 'cv';
+  if (!new RegExp('\\.' + ext + '$', 'i').test(n) && !(ext === 'jpg' && /\.jpe?g$/i.test(n))) n += '.' + ext;
+  return n.substring(0, 150);
+}
+function servirArchivo(idCand, res) {
+  const c = db.prepare('SELECT cv_hash FROM candidatos WHERE id = ?').get(idCand);
+  const f = c && c.cv_hash ? db.prepare('SELECT nombre, mime, base64 FROM cv_archivos WHERE cv_hash = ?').get(c.cv_hash) : null;
+  if (!f || !f.base64) return res.status(404).type('text/plain; charset=utf-8').send('Este candidato no tiene el archivo original guardado.');
   const buf = Buffer.from(f.base64, 'base64');
-  res.setHeader('Content-Type', f.mime || 'application/octet-stream');
-  res.setHeader('Content-Disposition', 'inline; filename="' + String(f.nombre || 'cv').replace(/"/g, '') + '"');
+  const t = tipoArchivoSeguro(buf, f.nombre);
+  const nombre = nombreDescarga(f.nombre, t.ext);
+  const ascii = nombre.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\x20-\x7E]/g, '_');
+  res.setHeader('Content-Type', t.tipo);
+  res.setHeader('Content-Disposition', (t.inline ? 'inline' : 'attachment') + '; filename="' + ascii + '"; filename*=UTF-8\'\'' + encodeURIComponent(nombre));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (t.tipo !== 'application/pdf') res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox");
   res.send(buf);
+}
+// con la clave en el header (el panel lo puede pedir directo)
+app.get('/api/candidatos/:id/archivo', (req, res) => servirArchivo(req.params.id, res));
+// el panel pide un link firmado y abre ESE link en otra pestaña: la clave nunca viaja en la URL
+app.post('/api/candidatos/:id/archivo/link', (req, res) => {
+  const id = Number(req.params.id);
+  const c = db.prepare('SELECT cv_hash FROM candidatos WHERE id = ?').get(id);
+  if (!c) return res.status(404).json({ error: 'Candidato no encontrado' });
+  if (!c.cv_hash || !db.prepare('SELECT 1 FROM cv_archivos WHERE cv_hash = ? AND base64 IS NOT NULL').get(c.cv_hash))
+    return res.status(404).json({ error: 'Este candidato no tiene el archivo original guardado (se cargo antes de que APTIA guardara los archivos, o se pego el texto).' });
+  res.json({ url: linkFirmado('archivo', id, '/api/archivo/' + id, 30) });
+});
+app.get('/api/archivo/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!linkValido('archivo', id, req)) return res.status(403).type('text/plain; charset=utf-8').send('Este link vencio (dura 30 minutos). Volve al panel y toca "Ver CV original" de nuevo.');
+  servirArchivo(id, res);
 });
 
+// las competencias que quedaron como excluyentes se muestran como competencias (aunque la lectura sea vieja)
+function marcarCompetenciasLectura(l) {
+  if (l && typeof l === 'object' && Array.isArray(l.excluyentes)) l.excluyentes.forEach(x => { if (esCompetenciaBlanda(x.requisito)) x.competencia = true; else delete x.competencia; });
+  return l;
+}
 function parseCand(r) {
+  // v2.8.2: un dato mal guardado en un candidato ya no rompe la lista entera (antes JSON.parse tiraba error 500)
   return Object.assign({}, r, {
-    fortalezas: JSON.parse(r.fortalezas || '[]'),
-    brechas: JSON.parse(r.brechas || '[]'),
-    excluyentes_no_cumplidos: JSON.parse(r.excluyentes_no_cumplidos || '[]'),
-    preguntas: JSON.parse(r.preguntas || '[]'),
+    fortalezas: parseLista(r.fortalezas),
+    brechas: parseLista(r.brechas),
+    excluyentes_no_cumplidos: parseLista(r.excluyentes_no_cumplidos),
+    preguntas: parseLista(r.preguntas),
     disc_resultado: r.disc_resultado ? safeParse(r.disc_resultado) : null,
     informe_final: r.informe_final ? safeParse(r.informe_final) : null,
     portfolio_analisis: r.portfolio_analisis ? safeParse(r.portfolio_analisis) : null,
     seguimiento: r.seguimiento ? safeParse(r.seguimiento) : {},
+    informe_textos: r.informe_textos ? safeParse(r.informe_textos) : null,
     guia_entrevista: r.guia_entrevista ? safeParse(r.guia_entrevista) : null,
-    cv_lectura: r.cv_lectura ? safeParse(r.cv_lectura) : null,
+    cv_lectura: r.cv_lectura ? marcarCompetenciasLectura(safeParse(r.cv_lectura)) : null,
     integridad: r.integridad ? safeParse(r.integridad) : null,
     links_detectados: r.links_detectados ? safeParse(r.links_detectados) : [],
     pdf_alertas: r.pdf_alertas ? safeParse(r.pdf_alertas) : null
@@ -2693,7 +3409,7 @@ app.post('/api/analizar', async (req, res) => {
     // carga manual: sin mail de aviso
     res.json(Object.assign({ id: id }, analisis));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    responderError(res, err);
   }
 });
 
@@ -2726,7 +3442,7 @@ app.post('/api/transcribir', async (req, res) => {
     const texto = await transcribirArchivo(b.archivo_base64, mime);
     if (texto.length < 40) return res.status(422).json({ error: 'No se pudo leer el contenido del archivo' });
     res.json({ texto });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { responderError(res, err); }
 });
 
 // Comparar: corre la lectura nueva sobre el CV guardado y la muestra al lado de la actual. NO GUARDA NADA.
@@ -2743,7 +3459,7 @@ app.post('/api/candidatos/:id/comparar-lectura', async (req, res) => {
       nueva,
       aviso: (cand.cv_texto || '').length === 5000 ? 'Ojo: este CV se guardo cortado (5.000 caracteres) por la version anterior. Para una lectura completa, volve a subir el archivo.' : null
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { responderError(res, err); }
 });
 
 // Cargar resultado DISC y calcular compatibilidad
@@ -2774,7 +3490,7 @@ app.post('/api/candidatos/:id/guia', async (req, res) => {
     const guia = await generarGuiaEntrevista(cand, busqueda, safeParse(cand.disc_resultado));
     db.prepare('UPDATE candidatos SET guia_entrevista=? WHERE id=?').run(JSON.stringify(guia), req.params.id);
     res.json(guia);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { responderError(res, err); }
 });
 
 app.post('/api/candidatos/:id/disc', async (req, res) => {
@@ -2791,7 +3507,7 @@ app.post('/api/candidatos/:id/disc', async (req, res) => {
     disc.informe = programarInforme(req.params.id, 'DISC') ? 'actualizando' : null;
     res.json(disc);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    responderError(res, err);
   }
 });
 
@@ -2874,7 +3590,7 @@ app.post('/api/candidatos/:id/portfolio', async (req, res) => {
     analisis.informe = programarInforme(req.params.id, 'portfolio') ? 'actualizando' : null;
     res.json(analisis);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    responderError(res, err);
   }
 });
 
@@ -2900,8 +3616,77 @@ app.post('/api/candidatos/:id/ajuste', (req, res) => {
   informe.scoreFinal = calc.scoreFinal;
   informe.desglose = calc.desglose;
   informe.veredictoFinal = veredictoPorScore(calc.scoreFinal, calc.desglose);
+  coherenciaCierre(informe, cand);
   db.prepare('UPDATE candidatos SET informe_final=?, score_final=? WHERE id=?').run(JSON.stringify(informe), informe.scoreFinal, req.params.id);
   res.json(informe);
+});
+
+// v2.7.2: el consultor corrige la clasificacion de la IA en un item de la entrevista (resultado vacio = vuelve a lo de la IA).
+// Se recalcula sin llamar a la IA y la correccion queda guardada para las proximas regeneraciones.
+app.post('/api/candidatos/:id/entrevista/corregir', (req, res) => {
+  const { tipo, texto, resultado } = req.body || {};
+  const T = CORRECCION_TIPOS[tipo];
+  if (!T) return res.status(400).json({ error: 'Tipo invalido' });
+  if (!String(texto || '').trim()) return res.status(400).json({ error: 'Falta el item' });
+  const val = String(resultado || '').toUpperCase().trim();
+  if (val && !T.valores.includes(val)) return res.status(400).json({ error: 'Resultado invalido' });
+  const cand = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Candidato no encontrado' });
+  const informe = cand.informe_final ? safeParse(cand.informe_final) : null;
+  const ev = informe && informe.evaluacionEntrevista;
+  if (!ev || !ev.detalle) return res.status(400).json({ error: 'Este candidato todavia no tiene la entrevista evaluada' });
+  let corr = cand.correcciones_entrevista ? safeParse(cand.correcciones_entrevista) : {};
+  if (!corr || typeof corr !== 'object') corr = {};
+  const k = claveCorreccion(tipo, texto);
+  const it = (ev.detalle[T.lista] || []).find(x => claveCorreccion(tipo, x[T.campo]) === k);
+  if (!it) return res.status(404).json({ error: 'No se encontro ese item en la entrevista' });
+  const deLaIA = it.corregido ? it.resultadoIA : it.resultado;
+  // elegir lo mismo que la IA = sacar la correccion (salvo que la IA lo haya anulado por la cita: ahi el consultor confirma que cuenta)
+  const igualIA = val === deLaIA && it.verificada !== false;
+  if (val && !igualIA) corr[k] = val; else delete corr[k];
+  db.prepare('UPDATE candidatos SET correcciones_entrevista=? WHERE id=?').run(JSON.stringify(corr), cand.id);
+  recalcularEvalEnt(ev, corr);
+  cand.correcciones_entrevista = JSON.stringify(corr);
+  const calc = calcularScoreFinal(cand, ev);
+  informe.scoreFinal = calc.scoreFinal;
+  informe.desglose = calc.desglose;
+  informe.veredictoFinal = veredictoPorScore(calc.scoreFinal, calc.desglose);
+  informe.textosDesactualizados = true;   // los textos todavia dicen lo que leyo la IA: el panel ofrece reescribirlos
+  coherenciaCierre(informe, cand);
+  db.prepare('UPDATE candidatos SET informe_final=?, score_final=? WHERE id=?').run(JSON.stringify(informe), informe.scoreFinal, cand.id);
+  res.json({ ok: true, scoreFinal: informe.scoreFinal, veredictoFinal: informe.veredictoFinal, entrevista: ev.score });
+});
+
+// v2.8: reescribe los textos del informe con el resultado actual (correcciones incluidas), sin volver a clasificar la entrevista
+app.post('/api/candidatos/:id/informe/redactar', async (req, res) => {
+  const cand = db.prepare('SELECT * FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Candidato no encontrado' });
+  if (!cand.informe_final) return res.status(400).json({ error: 'Este candidato todavia no tiene informe' });
+  const busqueda = db.prepare('SELECT * FROM busquedas WHERE id = ?').get(cand.busqueda_id) || {};
+  try {
+    const informe = await reescribirTextosInforme(cand, busqueda);
+    db.prepare('UPDATE candidatos SET informe_final=?, score_final=?, informe_actualizado=CURRENT_TIMESTAMP WHERE id=?').run(JSON.stringify(informe), informe.scoreFinal, cand.id);
+    if (req.body && req.body.descartarEdicion) db.prepare('UPDATE candidatos SET informe_textos=NULL WHERE id=?').run(cand.id);
+    res.json(informe);
+  } catch (err) { responderError(res, err); }
+});
+
+// v2.8: el consultor edita los textos del informe antes de guardarlo (null = volver a los textos del agente)
+const CAMPOS_TEXTO_INFORME = ['resumenEjecutivo', 'fortalezasPrincipales', 'puntosAtencion', 'perfilConductualCliente', 'cierreConsultor'];
+app.post('/api/candidatos/:id/informe/textos', (req, res) => {
+  const cand = db.prepare('SELECT id, informe_final FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!cand) return res.status(404).json({ error: 'Candidato no encontrado' });
+  const t = req.body && req.body.textos;
+  if (t === null) { db.prepare('UPDATE candidatos SET informe_textos=NULL WHERE id=?').run(cand.id); return res.json({ ok: true, informe_textos: null }); }
+  if (!t || typeof t !== 'object') return res.status(400).json({ error: 'Faltan los textos' });
+  const limpio = { editado: new Date().toISOString() };
+  CAMPOS_TEXTO_INFORME.forEach(k => {
+    if (!(k in t)) return;
+    if (Array.isArray(t[k])) limpio[k] = t[k].map(x => String(x || '').trim().substring(0, 1500)).filter(Boolean).slice(0, 12);
+    else limpio[k] = String(t[k] || '').trim().substring(0, 6000);
+  });
+  db.prepare('UPDATE candidatos SET informe_textos=? WHERE id=?').run(JSON.stringify(limpio), cand.id);
+  res.json({ ok: true, informe_textos: limpio });
 });
 
 // ═══════════════════════════════════════
@@ -2948,7 +3733,7 @@ async function procesarColaInformes() {
         if (colaInformes.includes(id)) db.prepare("UPDATE candidatos SET informe_estado='pendiente' WHERE id=?").run(id);
         console.log('✅ Informe actualizado: candidato ' + id + ' → ' + informe.scoreFinal);
       } catch (e) {
-        db.prepare("UPDATE candidatos SET informe_estado=? WHERE id=?").run('error: ' + String(e.message).substring(0, 200), id);
+        db.prepare("UPDATE candidatos SET informe_estado=? WHERE id=?").run('error: ' + mensajeErrorIA(e).substring(0, 200), id);
         console.log('❌ Error regenerando informe ' + id + ': ' + e.message);
       }
     }
@@ -2980,26 +3765,50 @@ app.post('/api/candidatos/:id/informe-final', async (req, res) => {
     res.json(informe);
   } catch (err) {
     // antes quedaba "generando" para siempre y el panel esperaba sin fin
-    db.prepare("UPDATE candidatos SET informe_estado=? WHERE id=?").run('error: ' + String(err.message).substring(0, 200), req.params.id);
-    res.status(500).json({ error: err.message });
+    db.prepare("UPDATE candidatos SET informe_estado=? WHERE id=?").run('error: ' + mensajeErrorIA(err).substring(0, 200), req.params.id);
+    responderError(res, err);
   }
 });
 
 // Borrar candidato
+// v2.8.2: se borra TODO lo suyo. Antes quedaban el archivo original del CV y una copia del texto en la cola
+// (importante si la persona pide que se eliminen sus datos).
 app.delete('/api/candidatos/:id', (req, res) => {
-  db.prepare('DELETE FROM candidatos WHERE id = ?').run(req.params.id);
+  const c = db.prepare('SELECT id, cv_hash FROM candidatos WHERE id = ?').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Candidato no encontrado' });
+  db.transaction(() => {
+    db.prepare('DELETE FROM candidatos WHERE id = ?').run(c.id);
+    db.prepare('DELETE FROM cola WHERE candidato_id = ?').run(c.id);
+    // el archivo y las copias en la cola se borran si ningun otro candidato usa el mismo CV (ej. la misma persona en otra busqueda)
+    if (c.cv_hash && !db.prepare('SELECT 1 FROM candidatos WHERE cv_hash = ?').get(c.cv_hash)) {
+      db.prepare('DELETE FROM cv_archivos WHERE cv_hash = ?').run(c.cv_hash);
+      db.prepare("DELETE FROM cola WHERE cv_hash = ? AND estado IN ('listo','error')").run(c.cv_hash);
+    }
+  })();
+  const i = colaInformes.indexOf(Number(c.id));
+  if (i >= 0) colaInformes.splice(i, 1);
   res.json({ ok: true });
 });
 
+// id numerico para armar un filtro (un valor invalido ya no rompe la consulta con un error 500)
+function idValido(v) { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; }
+
 // Stats
 app.get('/api/stats', (req, res) => {
-  const { busqueda_id } = req.query;
-  const where = busqueda_id ? ' WHERE busqueda_id = ' + Number(busqueda_id) : '';
-  const candidatos = db.prepare('SELECT COUNT(*) t FROM candidatos' + where).get().t;
-  const avanzar = db.prepare("SELECT COUNT(*) t FROM candidatos WHERE recomendacion = 'AVANZAR'" + (busqueda_id ? ' AND busqueda_id = ' + Number(busqueda_id) : '')).get().t;
+  const bid = idValido(req.query.busqueda_id);
+  const where = bid ? ' WHERE busqueda_id = ' + bid : '';
+  // "CV analizados" cuenta los que tienen score (los "Sin asignar" todavia no se analizaron)
+  const candidatos = db.prepare('SELECT COUNT(*) t FROM candidatos WHERE score IS NOT NULL' + (bid ? ' AND busqueda_id = ' + bid : '')).get().t;
+  const avanzar = db.prepare("SELECT COUNT(*) t FROM candidatos WHERE recomendacion = 'AVANZAR'" + (bid ? ' AND busqueda_id = ' + bid : '')).get().t;
   const prom = db.prepare('SELECT AVG(score) a FROM candidatos' + where).get().a || 0;
   const activas = db.prepare("SELECT COUNT(*) t FROM busquedas WHERE estado = 'activa'").get().t;
-  res.json({ candidatos, avanzar, activas, scorePromedio: Math.round(prom) });
+  // v2.8.2: CVs que la IA no pudo analizar (por ejemplo los que llegaron por mail sin credito en la cuenta de la IA)
+  const pend = db.prepare("SELECT COUNT(*) t FROM cola WHERE estado IN ('pendiente','procesando')").get().t;
+  const errs = db.prepare("SELECT COUNT(*) t FROM cola WHERE estado = 'error'").get().t;
+  const ult = errs ? db.prepare("SELECT error FROM cola WHERE estado = 'error' ORDER BY id DESC LIMIT 1").get() : null;
+  const sinAsignar = db.prepare('SELECT COUNT(*) t FROM candidatos WHERE busqueda_id IS NULL').get().t;
+  res.json({ candidatos, avanzar, activas, scorePromedio: Math.round(prom), sinAsignar,
+    cola: { pendientes: pend, errores: errs, ultimoError: ult ? ult.error : null } });
 });
 
 // Forzar revision de mails
@@ -3046,7 +3855,7 @@ app.get('/api/cola/estado', (req, res) => {
   const { busqueda_id } = req.query;
   // v2.7: ?ids=1,2,3 → solo los de esta carga (antes se mezclaban con los errores de cargas anteriores)
   const ids = String(req.query.ids || '').split(',').map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 1000);
-  const where = ids.length ? ' WHERE id IN (' + ids.join(',') + ')' : busqueda_id ? ' WHERE busqueda_id = ' + Number(busqueda_id) : '';
+  const where = ids.length ? ' WHERE id IN (' + ids.join(',') + ')' : idValido(busqueda_id) ? ' WHERE busqueda_id = ' + idValido(busqueda_id) : '';
   const rows = db.prepare('SELECT estado, COUNT(*) n FROM cola' + where + ' GROUP BY estado').all();
   const resumen = { pendiente: 0, procesando: 0, listo: 0, error: 0 };
   rows.forEach(r => { resumen[r.estado] = r.n; });
@@ -3060,22 +3869,43 @@ app.post('/api/cola/reintentar', (req, res) => {
   const body = req.body || {};
   const bid = Number(body.busqueda_id);
   const ids = (Array.isArray(body.ids) ? body.ids : []).map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 1000);
-  const r = ids.length ? db.prepare("UPDATE cola SET estado = 'pendiente', error = NULL WHERE estado = 'error' AND id IN (" + ids.join(',') + ")").run()
-    : bid ? db.prepare("UPDATE cola SET estado = 'pendiente', error = NULL WHERE estado = 'error' AND busqueda_id = ?").run(bid)
-    : db.prepare("UPDATE cola SET estado = 'pendiente', error = NULL WHERE estado = 'error'").run();
+  // v2.8.2: tambien adelanta los que estaban esperando un reintento automatico, y vuelve a contar los intentos desde cero
+  const set = "SET estado = 'pendiente', error = NULL, intentos = 0, reintentar_despues = NULL WHERE (estado = 'error' OR (estado = 'pendiente' AND reintentar_despues IS NOT NULL))";
+  const r = ids.length ? db.prepare('UPDATE cola ' + set + ' AND id IN (' + ids.join(',') + ')').run()
+    : bid ? db.prepare('UPDATE cola ' + set + ' AND busqueda_id = ?').run(bid)
+    : db.prepare('UPDATE cola ' + set).run();
   setTimeout(procesarCola, 200);
   res.json({ reintentando: r.changes });
 });
 
 app.post('/api/cola/limpiar', (req, res) => {
   const { busqueda_id } = req.body || {};
-  const where = busqueda_id ? ' AND busqueda_id = ' + Number(busqueda_id) : '';
+  if (busqueda_id != null && busqueda_id !== '' && !idValido(busqueda_id)) return res.status(400).json({ error: 'busqueda_id invalido' });
+  const where = idValido(busqueda_id) ? ' AND busqueda_id = ' + idValido(busqueda_id) : '';
   db.prepare("DELETE FROM cola WHERE estado IN ('listo','error')" + where).run();
   res.json({ ok: true });
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.7.1', lecturaCV: LECTURA_CV, clave: !!APTIA_KEY }));
-app.get('/', (req, res) => res.json({ service: 'APTIA agente', estado: 'online', endpoints: ['/api/busquedas', '/api/candidatos', '/api/stats'] }));
+// ───────── Copia de seguridad (v2.8.2) ─────────
+// Descarga la base completa (busquedas, candidatos, informes y CVs) en un solo archivo. El panel pide un link firmado
+// que vence en 5 minutos. Guardala en un lugar seguro: tiene datos personales de los candidatos.
+app.post('/api/backup/link', (req, res) => res.json({ url: linkFirmado('backup', 0, '/api/backup/descargar', 5) }));
+app.get('/api/backup/descargar', async (req, res) => {
+  if (!linkValido('backup', 0, req)) return res.status(403).type('text/plain; charset=utf-8').send('Este link vencio (dura 5 minutos). Volve al panel y toca "Descargar copia de seguridad" de nuevo.');
+  const tmp = path.join(os.tmpdir(), 'aptia-copia-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex') + '.db');
+  try {
+    await db.backup(tmp);
+  } catch (e) {
+    fs.unlink(tmp, () => {});
+    console.error('❌ Copia de seguridad: ' + e.message);
+    return res.status(500).type('text/plain; charset=utf-8').send('No se pudo armar la copia de seguridad: ' + e.message);
+  }
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.download(tmp, 'aptia-copia-' + new Date().toISOString().substring(0, 10) + '.db', () => fs.unlink(tmp, () => {}));
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'aptia-server', v: '2.8.2', lecturaCV: LECTURA_CV, clave: !!APTIA_KEY }));
+app.get('/', (req, res) => res.json({ service: 'APTIA agente', estado: 'online' }));
 
 // ═══════════════════════════════════════
 // ARRANQUE
@@ -3083,8 +3913,52 @@ app.get('/', (req, res) => res.json({ service: 'APTIA agente', estado: 'online',
 const PORT = process.env.PORT || 3000;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '120000', 10);
 
+// Una sola vez por version, al arrancar: recalcula scores e informes con las reglas nuevas (sin IA).
+// v2.7.2: competencias en Excluyentes sin tope, escalas de entrevista y DISC menos punitivas.
+// v2.8.0: DISC fuera del score, "Indistinto" no es requisito, sin doble castigo.
+// v2.8.1: la lectura del CV vuelve a ser tan rigurosa como antes (declarado = parcial, seniority y permanencia originales).
+const CLAVE_RECALCULO = 'recalculo_2_8_1';
+function recalcularTodoV272() {
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS meta (clave TEXT PRIMARY KEY, valor TEXT)');
+    if (db.prepare('SELECT valor FROM meta WHERE clave = ?').get(CLAVE_RECALCULO)) return;
+    let busq = 0, inf = 0;
+    db.prepare('SELECT id FROM busquedas').all().forEach(b => { try { recalcularBusqueda(b.id); busq++; } catch (e) { console.error('Recalculo v2.7.2, busqueda ' + b.id + ': ' + e.message); } });
+    db.prepare('SELECT * FROM candidatos WHERE informe_final IS NOT NULL').all().forEach(c => {
+      try {
+        const informe = safeParse(c.informe_final);
+        if (!informe || typeof informe !== 'object') return;
+        if (informe.evaluacionEntrevista) recalcularEvalEnt(informe.evaluacionEntrevista, c.correcciones_entrevista ? safeParse(c.correcciones_entrevista) : null);
+        const calc = calcularScoreFinal(c, informe.evaluacionEntrevista || null);
+        informe.scoreFinal = calc.scoreFinal; informe.desglose = calc.desglose;
+        informe.veredictoFinal = veredictoPorScore(calc.scoreFinal, calc.desglose);
+        coherenciaCierre(informe, c);
+        db.prepare('UPDATE candidatos SET informe_final=?, score_final=? WHERE id=?').run(JSON.stringify(informe), informe.scoreFinal, c.id);
+        inf++;
+      } catch (e) { console.error('Recalculo v2.7.2, candidato ' + c.id + ': ' + e.message); }
+    });
+    db.prepare('INSERT OR REPLACE INTO meta (clave, valor) VALUES (?, ?)').run(CLAVE_RECALCULO, new Date().toISOString());
+    console.log('🔄 Recalculo ' + CLAVE_RECALCULO + ': ' + busq + ' busquedas, ' + inf + ' informes');
+  } catch (e) { console.error('Recalculo ' + CLAVE_RECALCULO + ': ' + e.message); }
+}
+recalcularTodoV272();
+
+// ───────── Errores (v2.8.2) ─────────
+// Una ruta que no existe o un error no previsto responden en JSON, con un mensaje claro (antes salia una pagina HTML
+// y el panel mostraba "Unexpected token <"). El server sigue andando.
+app.use('/api', (req, res) => res.status(404).json({ error: 'Ruta inexistente: ' + req.method + ' ' + req.originalUrl.split('?')[0] + ' (¿el panel y el server son de la misma version?)' }));
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) return res.status(413).json({ error: 'El envio es demasiado grande (maximo 150 MB). Si es una carga multiple, subi menos archivos por vez.' });
+  if (err && (err.type === 'entity.parse.failed' || err.status === 400)) return res.status(400).json({ error: 'El pedido llego mal armado. Recarga el panel y proba de nuevo.' });
+  responderError(res, err);
+});
+// una promesa que falla sin que nadie la espere ya no tira abajo el server (Node lo cerraba)
+process.on('unhandledRejection', e => console.error('⚠️  Error sin manejar: ' + ((e && e.stack) || e)));
+
 app.listen(PORT, () => {
-  console.log('🚀 APTIA server v2.7.1 escuchando en puerto ' + PORT + ' · lectura de CV: ' + LECTURA_CV + ' · clave del panel: ' + (APTIA_KEY ? 'ACTIVA' : 'NO configurada (server abierto)'));
+  console.log('🚀 APTIA server v2.8.2 escuchando en puerto ' + PORT + ' · lectura de CV: ' + LECTURA_CV + ' · clave del panel: ' + (APTIA_KEY ? 'ACTIVA' : SIN_CLAVE_PERMITIDO ? 'SIN CLAVE (solo pruebas locales)' : 'NO configurada: el panel no funciona hasta cargar APTIA_KEY en Railway'));
+  if (APTIA_KEY && APTIA_KEY.length < 12) console.log('⚠️  La clave del panel (APTIA_KEY) tiene menos de 12 caracteres: conviene una mas larga (por ejemplo tres palabras y un numero).');
   console.log('📨 Monitor de Gmail cada ' + (CHECK_INTERVAL / 1000) + 's');
   console.log('⚙️  Worker de cola activo (procesa CVs en segundo plano)');
   setTimeout(revisarEmails, 5000);
